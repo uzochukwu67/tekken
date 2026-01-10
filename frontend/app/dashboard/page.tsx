@@ -10,7 +10,7 @@ import { MyBetsNew } from "@/components/my-bets-new"
 import { LiquidityPoolNew } from "@/components/liquidity-pool-new"
 import { StandingsNew } from "@/components/standings-new"
 import { useAccount } from "wagmi"
-import { useCurrentRound } from "@/lib/hooks/useGameData"
+import { useCurrentRound, useCurrentSeason, useIsCurrentRoundOngoing, useSeasonInfo } from "@/lib/hooks/useGameData"
 import { usePoolStats } from "@/lib/hooks/useBettingData"
 import { useLiquidityPoolStats } from "@/lib/hooks/useLiquidityData"
 import { useBettingPoolEvents } from "@/lib/hooks/useBettingPoolEvents"
@@ -19,6 +19,10 @@ import { formatUnits } from "viem"
 export default function HomePage() {
   const { isConnected } = useAccount()
   const { currentRoundId } = useCurrentRound()
+  const { currentSeasonId } = useCurrentSeason()
+  const roundStatus = useIsCurrentRoundOngoing()
+  const { isOngoing, remaining } = roundStatus
+  const { season } = useSeasonInfo(currentSeasonId as unknown as bigint | undefined)
   const { totalLiquidity } = useLiquidityPoolStats()
   const { seasonPool } = usePoolStats()
   const { betPlacedEvents } = useBettingPoolEvents()
@@ -33,8 +37,29 @@ export default function HomePage() {
     return () => clearInterval(interval)
   }, [])
 
+  // Update countdown from on-chain remaining when available
+  useEffect(() => {
+    if (remaining !== undefined) {
+      try {
+        setTimeRemaining(Number(remaining))
+      } catch (e) {
+        // ignore conversion errors
+      }
+    }
+  }, [remaining])
+
   const minutes = Math.floor(timeRemaining / 60)
   const seconds = timeRemaining % 60
+
+  // Helper to format large ETH-like values into human-friendly strings
+  const formatEthShort = (value: bigint | undefined | null) => {
+    if (!value) return "..."
+    const n = Number(formatUnits(value, 18))
+    if (Number.isNaN(n)) return "..."
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`
+    return n.toFixed(2)
+  }
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-background via-background to-secondary/20">
@@ -85,7 +110,7 @@ export default function HomePage() {
                 <div className="text-center space-y-2">
                   <Target className="w-8 h-8 mx-auto text-primary" />
                   <p className="text-2xl font-bold">{currentRoundId?.toString() || "..."}</p>
-                  <p className="text-xs text-muted-foreground">Current Round</p>
+                  <p className="text-xs text-muted-foreground">Season {season?.seasonId?.toString() || "..."} · Current Round</p>
                 </div>
               </CardContent>
             </Card>
@@ -94,9 +119,7 @@ export default function HomePage() {
               <CardContent className="pt-6">
                 <div className="text-center space-y-2">
                   <Coins className="w-8 h-8 mx-auto text-primary" />
-                  <p className="text-2xl font-bold">
-                    {totalLiquidity ? `${(Number(formatUnits(totalLiquidity, 18)) / 1000000).toFixed(1)}M` : "..."}
-                  </p>
+                  <p className="text-2xl font-bold">{formatEthShort(totalLiquidity)}</p>
                   <p className="text-xs text-muted-foreground">Total Liquidity</p>
                 </div>
               </CardContent>
@@ -106,7 +129,7 @@ export default function HomePage() {
               <CardContent className="pt-6">
                 <div className="text-center space-y-2">
                   <Users className="w-8 h-8 mx-auto text-primary" />
-                  <p className="text-2xl font-bold">{betPlacedEvents?.length.toLocaleString() || "..."}</p>
+                  <p className="text-2xl font-bold">{betPlacedEvents ? betPlacedEvents.length.toLocaleString() : "..."}</p>
                   <p className="text-xs text-muted-foreground">Total Bets</p>
                 </div>
               </CardContent>
@@ -116,9 +139,7 @@ export default function HomePage() {
               <CardContent className="pt-6">
                 <div className="text-center space-y-2">
                   <Trophy className="w-8 h-8 mx-auto text-primary" />
-                  <p className="text-2xl font-bold">
-                    {seasonPool ? `${(Number(formatUnits(seasonPool, 18)) / 1000).toFixed(0)}K` : "..."}
-                  </p>
+                  <p className="text-2xl font-bold">{formatEthShort(seasonPool)}</p>
                   <p className="text-xs text-muted-foreground">Season Pool</p>
                 </div>
               </CardContent>
@@ -146,6 +167,9 @@ export default function HomePage() {
                     {String(minutes).padStart(2, "0")}:{String(seconds).padStart(2, "0")}
                   </p>
                 </div>
+                {isOngoing ? (
+                  <div className="px-3 py-2 bg-green-600 text-white rounded-lg text-sm">Ongoing</div>
+                ) : null}
               </div>
             </div>
 

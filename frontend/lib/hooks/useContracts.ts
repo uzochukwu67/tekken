@@ -1,10 +1,10 @@
 import { useChainId } from "wagmi"
-import { getContractAddresses } from "@/lib/config/contracts"
+import { getDeployedAddresses } from "@/lib/deployedAddresses"
 import { GameEngineABI, BettingPoolABI, LiquidityPoolABI, LeagueTokenABI } from "@/lib/abis"
 
 export function useContracts() {
   const chainId = useChainId()
-  const addresses = getContractAddresses(chainId)
+  const addresses = getDeployedAddresses(chainId)
 
   if (!addresses) {
     return {

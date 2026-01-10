@@ -2,190 +2,214 @@
 
 import { useState, useEffect } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { Badge } from "@/components/ui/badge"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { WalletConnect } from "@/components/wallet-connect"
-import { BettingInterface } from "@/components/betting-interface"
-import { MyBets } from "@/components/my-bets"
-import { LiquidityPool } from "@/components/liquidity-pool"
-import { Standings } from "@/components/standings"
-import { Trophy, TrendingUp, Users, DollarSign } from "lucide-react"
+import { TrendingUp, Users, Coins, Trophy, Target, Zap, Shield, Settings } from "lucide-react"
+import Link from "next/link"
+import { WalletConnect } from "@/components/wallet-connect-new"
+import { BettingInterfaceNew } from "@/components/betting-interface-new"
+import { MyBetsNew } from "@/components/my-bets-new"
+import { LiquidityPoolNew } from "@/components/liquidity-pool-new"
+import { StandingsNew } from "@/components/standings-new"
+import { useAccount } from "wagmi"
+import { useCurrentRound } from "@/lib/hooks/useGameData"
+import { usePoolStats } from "@/lib/hooks/useBettingData"
+import { useLiquidityPoolStats } from "@/lib/hooks/useLiquidityData"
+import { useBettingPoolEvents } from "@/lib/hooks/useBettingPoolEvents"
+import { formatUnits } from "viem"
 
-export default function Home() {
-  const [isConnected, setIsConnected] = useState(false)
-  const [timeRemaining, setTimeRemaining] = useState(15 * 60) // 15 minutes in seconds
+export default function HomePage() {
+  const { isConnected } = useAccount()
+  const { currentRoundId } = useCurrentRound()
+  const { totalLiquidity } = useLiquidityPoolStats()
+  const { seasonPool } = usePoolStats()
+  const { betPlacedEvents } = useBettingPoolEvents()
+
+  const [timeRemaining, setTimeRemaining] = useState(15 * 60) // Mock countdown, replace with actual round deadline
 
   useEffect(() => {
-    const timer = setInterval(() => {
+    const interval = setInterval(() => {
       setTimeRemaining((prev) => (prev > 0 ? prev - 1 : 15 * 60))
     }, 1000)
-    return () => clearInterval(timer)
+
+    return () => clearInterval(interval)
   }, [])
 
-  const formatTime = (seconds: number) => {
-    const mins = Math.floor(seconds / 60)
-    const secs = seconds % 60
-    return `${mins}:${secs.toString().padStart(2, "0")}`
-  }
+  const minutes = Math.floor(timeRemaining / 60)
+  const seconds = timeRemaining % 60
 
   return (
-    <div className="min-h-screen bg-background">
+    <div className="min-h-screen bg-gradient-to-br from-background via-background to-secondary/20">
       {/* Header */}
-      <header className="border-b border-border/40 backdrop-blur-sm sticky top-0 z-50 bg-background/80">
+      <header className="border-b border-border/40 bg-background/80 backdrop-blur-xl sticky top-0 z-50">
         <div className="container mx-auto px-4 py-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-primary to-accent flex items-center justify-center">
-                <Trophy className="w-6 h-6 text-primary-foreground" />
-              </div>
+              <Trophy className="w-8 h-8 text-primary" />
               <div>
-                <h1 className="text-2xl font-bold tracking-tight">iVirtualz</h1>
-                <p className="text-xs text-muted-foreground">Sports Betting Protocol</p>
+                <h1 className="text-2xl font-bold bg-gradient-to-r from-primary to-accent bg-clip-text text-transparent">
+                  iVirtualz Sports League
+                </h1>
+                <p className="text-xs text-muted-foreground">Web3 Prediction Protocol</p>
               </div>
             </div>
-            <WalletConnect isConnected={isConnected} setIsConnected={setIsConnected} />
+            <div className="flex items-center gap-3">
+              <Link href="/admin">
+                <Settings className="w-5 h-5 text-muted-foreground hover:text-primary transition-colors cursor-pointer" />
+              </Link>
+              <WalletConnect />
+            </div>
           </div>
         </div>
       </header>
 
-      <div className="container mx-auto px-4 py-8">
-        {/* Hero Section */}
-        <div className="mb-12 text-center space-y-4">
-          <h2 className="text-5xl md:text-6xl font-bold tracking-tight text-balance">
-            Unlock the Full Potential of{" "}
-            <span className="bg-gradient-to-r from-primary via-accent to-primary bg-clip-text text-transparent animate-pulse">
-              Web3 Sports Betting
-            </span>
-          </h2>
-          <p className="text-xl text-muted-foreground max-w-3xl mx-auto text-pretty">
-            Experience decentralized sports betting with dynamic odds, liquidity pools, and real-time match results
-            powered by blockchain technology
-          </p>
+      {/* Hero Section */}
+      <section className="border-b border-border/40 bg-gradient-to-r from-primary/5 via-accent/5 to-secondary/5">
+        <div className="container mx-auto px-4 py-12 md:py-16">
+          <div className="max-w-4xl mx-auto text-center space-y-6">
+            <div className="inline-flex items-center gap-2 px-4 py-2 bg-primary/10 border border-primary/20 rounded-full text-sm">
+              <Zap className="w-4 h-4 text-primary" />
+              <span className="font-medium">Live on Base Sepolia</span>
+            </div>
+            <h2 className="text-4xl md:text-6xl font-bold tracking-tight">
+              Predict. Earn.{" "}
+              <span className="bg-gradient-to-r from-primary to-accent bg-clip-text text-transparent">Win Big.</span>
+            </h2>
+            <p className="text-lg md:text-xl text-muted-foreground max-w-2xl mx-auto">
+              The first fully on-chain sports prediction market with dynamic odds, liquidity mining, and
+              provably-fair VRF results.
+            </p>
+          </div>
         </div>
+      </section>
 
-        {/* Stats Grid */}
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-          <Card className="bg-card/50 backdrop-blur border-border/40">
-            <CardHeader className="pb-3">
-              <CardDescription className="text-xs uppercase tracking-wider">Current Round</CardDescription>
-              <CardTitle className="text-3xl font-bold">Round 5</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="flex items-center gap-2">
-                <Badge variant="secondary" className="text-xs">
-                  {formatTime(timeRemaining)} left
-                </Badge>
+      {/* Stats Section */}
+      <section className="border-b border-border/40 bg-background/50">
+        <div className="container mx-auto px-4 py-8">
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <Card className="bg-card/50 backdrop-blur border-border/40">
+              <CardContent className="pt-6">
+                <div className="text-center space-y-2">
+                  <Target className="w-8 h-8 mx-auto text-primary" />
+                  <p className="text-2xl font-bold">{currentRoundId?.toString() || "..."}</p>
+                  <p className="text-xs text-muted-foreground">Current Round</p>
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card className="bg-card/50 backdrop-blur border-border/40">
+              <CardContent className="pt-6">
+                <div className="text-center space-y-2">
+                  <Coins className="w-8 h-8 mx-auto text-primary" />
+                  <p className="text-2xl font-bold">
+                    {totalLiquidity ? `${(Number(formatUnits(totalLiquidity, 18)) / 1000000).toFixed(1)}M` : "..."}
+                  </p>
+                  <p className="text-xs text-muted-foreground">Total Liquidity</p>
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card className="bg-card/50 backdrop-blur border-border/40">
+              <CardContent className="pt-6">
+                <div className="text-center space-y-2">
+                  <Users className="w-8 h-8 mx-auto text-primary" />
+                  <p className="text-2xl font-bold">{betPlacedEvents?.length.toLocaleString() || "..."}</p>
+                  <p className="text-xs text-muted-foreground">Total Bets</p>
+                </div>
+              </CardContent>
+            </Card>
+
+            <Card className="bg-card/50 backdrop-blur border-border/40">
+              <CardContent className="pt-6">
+                <div className="text-center space-y-2">
+                  <Trophy className="w-8 h-8 mx-auto text-primary" />
+                  <p className="text-2xl font-bold">
+                    {seasonPool ? `${(Number(formatUnits(seasonPool, 18)) / 1000).toFixed(0)}K` : "..."}
+                  </p>
+                  <p className="text-xs text-muted-foreground">Season Pool</p>
+                </div>
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      </section>
+
+      {/* Main Content */}
+      <section className="py-12">
+        <div className="container mx-auto px-4">
+          <Tabs defaultValue="bet" className="space-y-8">
+            <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+              <TabsList className="grid w-full md:w-auto grid-cols-2 md:grid-cols-4 gap-2">
+                <TabsTrigger value="bet">Place Bets</TabsTrigger>
+                <TabsTrigger value="mybets">My Bets</TabsTrigger>
+                <TabsTrigger value="pool">Liquidity Pool</TabsTrigger>
+                <TabsTrigger value="standings">Standings</TabsTrigger>
+              </TabsList>
+
+              <div className="flex items-center gap-4">
+                <div className="px-4 py-2 bg-card/50 backdrop-blur rounded-lg border border-border/40">
+                  <p className="text-xs text-muted-foreground">Next Round</p>
+                  <p className="text-2xl font-bold font-mono">
+                    {String(minutes).padStart(2, "0")}:{String(seconds).padStart(2, "0")}
+                  </p>
+                </div>
               </div>
-            </CardContent>
-          </Card>
+            </div>
 
-          <Card className="bg-card/50 backdrop-blur border-border/40">
-            <CardHeader className="pb-3">
-              <CardDescription className="text-xs uppercase tracking-wider flex items-center gap-2">
-                <DollarSign className="w-4 h-4" />
-                Total Liquidity
-              </CardDescription>
-              <CardTitle className="text-3xl font-bold">2.4M</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-xs text-muted-foreground">LEAGUE tokens locked</p>
-            </CardContent>
-          </Card>
+            <TabsContent value="bet" className="space-y-6">
+              <BettingInterfaceNew />
+            </TabsContent>
 
-          <Card className="bg-card/50 backdrop-blur border-border/40">
-            <CardHeader className="pb-3">
-              <CardDescription className="text-xs uppercase tracking-wider flex items-center gap-2">
-                <TrendingUp className="w-4 h-4" />
-                Active Bets
-              </CardDescription>
-              <CardTitle className="text-3xl font-bold">1,247</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-xs text-muted-foreground">This round</p>
-            </CardContent>
-          </Card>
+            <TabsContent value="mybets" className="space-y-6">
+              <MyBetsNew />
+            </TabsContent>
 
-          <Card className="bg-card/50 backdrop-blur border-border/40">
-            <CardHeader className="pb-3">
-              <CardDescription className="text-xs uppercase tracking-wider flex items-center gap-2">
-                <Users className="w-4 h-4" />
-                Season Pool
-              </CardDescription>
-              <CardTitle className="text-3xl font-bold">567K</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-xs text-muted-foreground">For end rewards</p>
-            </CardContent>
-          </Card>
+            <TabsContent value="pool" className="space-y-6">
+              <LiquidityPoolNew />
+            </TabsContent>
+
+            <TabsContent value="standings" className="space-y-6">
+              <StandingsNew />
+            </TabsContent>
+          </Tabs>
         </div>
+      </section>
 
-        {/* Main Content Tabs */}
-        <Tabs defaultValue="betting" className="space-y-6">
-          <TabsList className="grid w-full grid-cols-4 lg:w-auto lg:inline-grid">
-            <TabsTrigger value="betting">Place Bets</TabsTrigger>
-            <TabsTrigger value="mybets">My Bets</TabsTrigger>
-            <TabsTrigger value="liquidity">Liquidity Pool</TabsTrigger>
-            <TabsTrigger value="standings">Standings</TabsTrigger>
-          </TabsList>
+      {/* Features Section */}
+      <section className="border-t border-border/40 bg-gradient-to-b from-background to-secondary/10 py-16">
+        <div className="container mx-auto px-4">
+          <h3 className="text-3xl font-bold text-center mb-12">Why Choose iVirtualz?</h3>
+          <div className="grid md:grid-cols-3 gap-8">
+            <Card className="bg-card/50 backdrop-blur border-border/40">
+              <CardHeader>
+                <TrendingUp className="w-12 h-12 mb-4 text-primary" />
+                <CardTitle>Dynamic Odds</CardTitle>
+                <CardDescription>Real-time odds that adjust based on betting volume and pool liquidity</CardDescription>
+              </CardHeader>
+            </Card>
 
-          <TabsContent value="betting" className="space-y-6">
-            <BettingInterface isConnected={isConnected} />
-          </TabsContent>
+            <Card className="bg-card/50 backdrop-blur border-border/40">
+              <CardHeader>
+                <Coins className="w-12 h-12 mb-4 text-primary" />
+                <CardTitle>Liquidity Mining</CardTitle>
+                <CardDescription>Earn 25% of losing bets as an LP provider with instant withdrawals</CardDescription>
+              </CardHeader>
+            </Card>
 
-          <TabsContent value="mybets">
-            <MyBets isConnected={isConnected} />
-          </TabsContent>
-
-          <TabsContent value="liquidity">
-            <LiquidityPool isConnected={isConnected} />
-          </TabsContent>
-
-          <TabsContent value="standings">
-            <Standings />
-          </TabsContent>
-        </Tabs>
-
-        {/* Features Section */}
-        <div className="mt-20 grid md:grid-cols-3 gap-8">
-          <Card className="bg-card/50 backdrop-blur border-border/40">
-            <CardHeader>
-              <CardTitle className="text-lg">Dynamic Odds</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-sm text-muted-foreground">
-                Live odds that adjust based on betting volume, ensuring fair markets and optimal returns
-              </p>
-            </CardContent>
-          </Card>
-
-          <Card className="bg-card/50 backdrop-blur border-border/40">
-            <CardHeader>
-              <CardTitle className="text-lg">Liquidity Mining</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-sm text-muted-foreground">
-                Provide liquidity and earn rewards from protocol fees while supporting the betting ecosystem
-              </p>
-            </CardContent>
-          </Card>
-
-          <Card className="bg-card/50 backdrop-blur border-border/40">
-            <CardHeader>
-              <CardTitle className="text-lg">VRF-Powered Results</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <p className="text-sm text-muted-foreground">
-                Provably fair match outcomes using Chainlink VRF for truly random and transparent results
-              </p>
-            </CardContent>
-          </Card>
+            <Card className="bg-card/50 backdrop-blur border-border/40">
+              <CardHeader>
+                <Shield className="w-12 h-12 mb-4 text-primary" />
+                <CardTitle>VRF-Powered Results</CardTitle>
+                <CardDescription>Chainlink VRF ensures provably-fair and verifiable match outcomes</CardDescription>
+              </CardHeader>
+            </Card>
+          </div>
         </div>
-      </div>
+      </section>
 
       {/* Footer */}
-      <footer className="border-t border-border/40 mt-20 py-8">
+      <footer className="border-t border-border/40 bg-background/80 backdrop-blur py-8">
         <div className="container mx-auto px-4 text-center text-sm text-muted-foreground">
-          <p>© 2025 iVirtualz Protocol. Powered by Web3 technology.</p>
+          <p>&copy; 2025 iVirtualz Sports League. Built with Solidity + Next.js + wagmi on Base.</p>
         </div>
       </footer>
     </div>

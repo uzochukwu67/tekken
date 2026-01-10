@@ -2,7 +2,7 @@ import { baseSepolia, base, mainnet, sepolia } from "wagmi/chains"
 import type { Chain } from "wagmi/chains"
 
 // Custom chain configurations
-export const supportedChains = [baseSepolia, base] as const
+export const supportedChains = [baseSepolia, base, sepolia] as const
 
 export type SupportedChainId = (typeof supportedChains)[number]["id"]
 
@@ -21,22 +21,12 @@ export const chainMetadata: Record<
     }
   }
 > = {
-  [baseSepolia.id]: {
-    name: "Base Sepolia",
-    shortName: "Base Sepolia",
-    icon: "⚡",
-    blockExplorer: "https://sepolia.basescan.org",
-    nativeCurrency: {
-      name: "Ethereum",
-      symbol: "ETH",
-      decimals: 18,
-    },
-  },
-  [base.id]: {
-    name: "Base",
-    shortName: "Base",
-    icon: "🔵",
-    blockExplorer: "https://basescan.org",
+  
+  [sepolia.id]: {
+    name: "Sepolia",
+    shortName: "Sepolia",
+    icon: "🟣",
+    blockExplorer: "https://sepolia.etherscan.io",
     nativeCurrency: {
       name: "Ethereum",
       symbol: "ETH",

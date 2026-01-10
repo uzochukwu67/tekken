@@ -3,12 +3,15 @@
 import { ConnectButton } from "@rainbow-me/rainbowkit"
 import { Button } from "@/components/ui/button"
 import { Wallet, LogOut } from "lucide-react"
-import { useAccount, useBalance, useDisconnect } from "wagmi"
+import { useAccount, useBalance, useDisconnect, useSwitchChain, useChains, useChainId } from "wagmi"
 import { useContracts } from "@/lib/hooks/useContracts"
 import { formatUnits } from "viem"
 
 export function WalletConnect() {
   const { address, isConnected } = useAccount()
+  const { switchChain } = useSwitchChain()
+  const chains = useChains()
+  const chainId = useChainId()
   const { disconnect } = useDisconnect()
   const { leagueToken } = useContracts()
 
@@ -32,11 +35,29 @@ export function WalletConnect() {
           <p className="text-xs text-muted-foreground">
             {address.slice(0, 6)}...{address.slice(-4)}
           </p>
+          <p>
+            Network: {chainId === 11155111 ? "Ethereum" : chainId === 8453 ? "Base" : chainId} 
+          </p>
         </div>
         <Button variant="outline" size="sm" onClick={() => disconnect()}>
           <LogOut className="w-4 h-4 mr-2" />
           Disconnect
         </Button>
+        {/* switch chain */}
+        {
+          chains.length > 1 && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                
+                switchChain?.({chainId: 11155111})
+              }}
+            >
+              Switch Network
+            </Button>
+          )
+        }
       </div>
     )
   }

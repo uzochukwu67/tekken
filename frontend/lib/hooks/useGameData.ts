@@ -5,20 +5,25 @@ import { useContracts } from "./useContracts"
 import type { Address } from "viem"
 
 export type Team = {
-  id: bigint
   name: string
-  attack: number
-  defense: number
-  rating: number
+  wins: bigint
+  draws: bigint
+  losses: bigint
+  points: bigint
+  goalsFor: bigint
+  goalsAgainst: bigint
 }
 
 export type Match = {
-  homeTeam: bigint
-  awayTeam: bigint
+  homeTeamId: bigint
+  awayTeamId: bigint
   homeScore: number
   awayScore: number
   outcome: number
   settled: boolean
+  homeOdds: bigint
+  awayOdds: bigint
+  drawOdds: bigint
 }
 
 export type Round = {
@@ -37,14 +42,14 @@ export function useCurrentRound() {
   const { data: currentRoundId, refetch } = useReadContract({
     address: gameEngine?.address,
     abi: gameEngine?.abi,
-    functionName: "currentRoundId",
+    functionName: "getCurrentRound",
     query: {
       enabled: !!gameEngine?.address,
       refetchInterval: 5000, // Refetch every 5 seconds
     },
   })
 
-  return { currentRoundId, refetch }
+  return { currentRoundId: currentRoundId as bigint | undefined, refetch }
 }
 
 export function useRound(roundId: bigint | undefined) {
@@ -88,13 +93,34 @@ export function useMatch(roundId: bigint | undefined, matchIndex: bigint | undef
   }
 }
 
+export function useRoundMatches(roundId: bigint | undefined) {
+  const { gameEngine } = useContracts()
+
+  const { data, isLoading, refetch } = useReadContract({
+    address: gameEngine?.address,
+    abi: gameEngine?.abi,
+    functionName: "getRoundMatches",
+    args: roundId !== undefined ? [roundId] : undefined,
+    query: {
+      enabled: !!gameEngine?.address && roundId !== undefined,
+      refetchInterval: 10000,
+    },
+  })
+
+  return {
+    matches: data as Match[] | undefined,
+    isLoading,
+    refetch,
+  }
+}
+
 export function useTeam(teamId: bigint | undefined) {
   const { gameEngine } = useContracts()
 
   const { data, isLoading } = useReadContract({
     address: gameEngine?.address,
     abi: gameEngine?.abi,
-    functionName: "teams",
+    functionName: "getTeam",
     args: teamId !== undefined ? [teamId] : undefined,
     query: {
       enabled: !!gameEngine?.address && teamId !== undefined,
@@ -114,7 +140,7 @@ export function useAllTeams() {
   const contracts = Array.from({ length: 20 }, (_, i) => ({
     address: gameEngine?.address,
     abi: gameEngine?.abi,
-    functionName: "teams" as const,
+    functionName: "getTeam" as const,
     args: [BigInt(i)],
   }))
 
@@ -125,12 +151,9 @@ export function useAllTeams() {
     },
   })
 
-  const teams = data?.map((result, index) => {
+  const teams = data?.map((result) => {
     if (result.status === "success") {
-      return {
-        id: BigInt(index),
-        ...(result.result as Omit<Team, "id">),
-      }
+      return result.result as Team
     }
     return null
   }).filter(Boolean) as Team[]
@@ -202,11 +225,92 @@ export function useCurrentSeason() {
   const { data: currentSeasonId } = useReadContract({
     address: gameEngine?.address,
     abi: gameEngine?.abi,
-    functionName: "currentSeasonId",
+    functionName: "getCurrentSeason",
     query: {
       enabled: !!gameEngine?.address,
     },
   })
 
-  return { currentSeasonId }
+  return { currentSeasonId: currentSeasonId as bigint | undefined }
+}
+
+// Derived round/season utilities
+export function useRoundStatus(roundId: bigint | undefined) {
+  const { gameEngine } = useContracts()
+
+  const { data: roundData, isLoading: loadingRound } = useReadContract({
+    address: gameEngine?.address,
+    abi: gameEngine?.abi,
+    functionName: "getRound",
+    args: roundId !== undefined ? [roundId] : undefined,
+    query: {
+      enabled: !!gameEngine?.address && roundId !== undefined,
+      refetchInterval: 5000,
+    },
+  })
+
+  const { data: roundDurationData } = useReadContract({
+    address: gameEngine?.address,
+    abi: gameEngine?.abi,
+    functionName: "ROUND_DURATION",
+    query: {
+      enabled: !!gameEngine?.address,
+    },
+  })
+
+  const round = roundData as any | undefined
+
+  const ROUND_DURATION = (roundDurationData as bigint) || 0n
+  const now = BigInt(Math.floor(Date.now() / 1000))
+
+  const startTime: bigint | undefined = round?.startTime
+  const settled: boolean = round?.settled ?? false
+
+  let elapsed: bigint | undefined
+  let remaining: bigint | undefined
+  let isOngoing = false
+
+  if (startTime && startTime > 0n) {
+    elapsed = now > startTime ? now - startTime : 0n
+    if (ROUND_DURATION > 0n) {
+      remaining = elapsed >= ROUND_DURATION ? 0n : ROUND_DURATION - elapsed
+    }
+    if (ROUND_DURATION === 0n) {
+      isOngoing = !settled && now >= startTime
+    } else {
+      isOngoing = !settled && now >= startTime && now < startTime + ROUND_DURATION
+    }
+  }
+
+  return {
+    round,
+    startTime,
+    settled,
+    elapsed,
+    remaining,
+    isOngoing,
+    isLoading: loadingRound,
+  }
+}
+
+export function useIsCurrentRoundOngoing() {
+  const { currentRoundId } = useCurrentRound()
+  return useRoundStatus(currentRoundId as unknown as bigint | undefined)
+}
+
+export function useSeasonInfo(seasonId: bigint | undefined) {
+  const { gameEngine } = useContracts()
+
+  const { data: seasonData, isLoading } = useReadContract({
+    address: gameEngine?.address,
+    abi: gameEngine?.abi,
+    functionName: "getSeason",
+    args: seasonId !== undefined ? [seasonId] : undefined,
+    query: {
+      enabled: !!gameEngine?.address && seasonId !== undefined,
+      refetchInterval: 5000,
+    },
+  })
+
+  return { season: seasonData as any | undefined, isLoading }
 }

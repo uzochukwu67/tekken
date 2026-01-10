@@ -9,8 +9,8 @@ import { ArrowUpRight, ArrowDownRight, Minus, Trash2, Loader2 } from "lucide-rea
 import { Separator } from "@/components/ui/separator"
 import { useAccount, useWriteContract, useWaitForTransactionReceipt } from "wagmi"
 import { useContracts } from "@/lib/hooks/useContracts"
-import { useCurrentRound, useMatch, useTeam } from "@/lib/hooks/useGameData"
-import { useAllMatchOdds, useCalculatePotentialPayout } from "@/lib/hooks/useBettingData"
+import { useCurrentRound, useRoundMatches, useTeam, type Match } from "@/lib/hooks/useGameData"
+import { useCalculatePotentialPayout } from "@/lib/hooks/useBettingData"
 import { formatUnits, parseUnits } from "viem"
 import { toast } from "sonner"
 
@@ -26,6 +26,7 @@ export function BettingInterfaceNew() {
   const { address, isConnected } = useAccount()
   const { gameEngine, bettingPool, leagueToken } = useContracts()
   const { currentRoundId } = useCurrentRound()
+  const { matches, isLoading: matchesLoading } = useRoundMatches(currentRoundId)
 
   const [predictions, setPredictions] = useState<Prediction[]>([])
   const [betAmount, setBetAmount] = useState("")
@@ -134,15 +135,33 @@ export function BettingInterfaceNew() {
         </div>
 
         <div className="space-y-3">
-          {Array.from({ length: 10 }, (_, i) => (
-            <MatchCard
-              key={i}
-              matchIndex={BigInt(i)}
-              roundId={currentRoundId}
-              onAddPrediction={addPrediction}
-              isConnected={isConnected}
-            />
-          ))}
+          {matchesLoading ? (
+            Array.from({ length: 10 }, (_, i) => (
+              <Card key={i} className="bg-card/50 backdrop-blur border-border/40">
+                <CardContent className="p-4">
+                  <div className="flex items-center justify-center h-20">
+                    <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
+                  </div>
+                </CardContent>
+              </Card>
+            ))
+          ) : matches && matches.length > 0 ? (
+            matches.map((match, i) => (
+              <MatchCard
+                key={i}
+                match={match}
+                matchIndex={BigInt(i)}
+                onAddPrediction={addPrediction}
+                isConnected={isConnected}
+              />
+            ))
+          ) : (
+            <Card className="bg-card/50 backdrop-blur border-border/40">
+              <CardContent className="p-6 text-center text-muted-foreground">
+                No matches available for this round
+              </CardContent>
+            </Card>
+          )}
         </div>
       </div>
 
@@ -274,22 +293,25 @@ export function BettingInterfaceNew() {
 
 // Match Card Component
 function MatchCard({
+  match,
   matchIndex,
-  roundId,
   onAddPrediction,
   isConnected,
 }: {
+  match: Match
   matchIndex: bigint
-  roundId: bigint | undefined
   onAddPrediction: (matchIndex: bigint, homeTeam: string, awayTeam: string, outcome: number, odds: bigint) => void
   isConnected: boolean
 }) {
-  const { match, isLoading: matchLoading } = useMatch(roundId, matchIndex)
-  const { team: homeTeam } = useTeam(match?.homeTeam)
-  const { team: awayTeam } = useTeam(match?.awayTeam)
-  const { homeOdds, awayOdds, drawOdds, isLoading: oddsLoading } = useAllMatchOdds(roundId, matchIndex)
+  const { team: homeTeam, isLoading: homeTeamLoading } = useTeam(match.homeTeamId)
+  const { team: awayTeam, isLoading: awayTeamLoading } = useTeam(match.awayTeamId)
 
-  if (matchLoading || !match || !homeTeam || !awayTeam) {
+  // Odds are included in the match struct from contract
+  const homeOdds = match.homeOdds
+  const awayOdds = match.awayOdds
+  const drawOdds = match.drawOdds
+
+  if (homeTeamLoading || awayTeamLoading || !homeTeam || !awayTeam) {
     return (
       <Card className="bg-card/50 backdrop-blur border-border/40">
         <CardContent className="p-4">
@@ -318,7 +340,7 @@ function MatchCard({
             onClick={() =>
               homeOdds && onAddPrediction(matchIndex, homeTeam.name, awayTeam.name, 0, homeOdds)
             }
-            disabled={!isConnected || oddsLoading || !homeOdds}
+            disabled={!isConnected || !homeOdds}
           >
             <span className="text-xs font-medium mb-1 truncate w-full text-center">{homeTeam.name}</span>
             <div className="flex items-center gap-1 text-lg font-bold">
@@ -334,7 +356,7 @@ function MatchCard({
             onClick={() =>
               drawOdds && onAddPrediction(matchIndex, homeTeam.name, awayTeam.name, 2, drawOdds)
             }
-            disabled={!isConnected || oddsLoading || !drawOdds}
+            disabled={!isConnected || !drawOdds}
           >
             <span className="text-xs font-medium mb-1">Draw</span>
             <div className="flex items-center gap-1 text-lg font-bold">
@@ -350,7 +372,7 @@ function MatchCard({
             onClick={() =>
               awayOdds && onAddPrediction(matchIndex, homeTeam.name, awayTeam.name, 1, awayOdds)
             }
-            disabled={!isConnected || oddsLoading || !awayOdds}
+            disabled={!isConnected || !awayOdds}
           >
             <span className="text-xs font-medium mb-1 truncate w-full text-center">{awayTeam.name}</span>
             <div className="flex items-center gap-1 text-lg font-bold">

@@ -7,6 +7,8 @@ import {
   coinbaseWallet,
   walletConnectWallet,
   rainbowWallet,
+  injectedWallet,
+
 } from "@rainbow-me/rainbowkit/wallets"
 import { supportedChains } from "./chains"
 
@@ -17,7 +19,7 @@ const connectors = connectorsForWallets(
   [
     {
       groupName: "Recommended",
-      wallets: [metaMaskWallet, coinbaseWallet, walletConnectWallet, rainbowWallet],
+      wallets: [metaMaskWallet, coinbaseWallet, injectedWallet, walletConnectWallet, rainbowWallet],
     },
   ],
   {
@@ -30,9 +32,6 @@ const connectors = connectorsForWallets(
 export const config = createConfig({
   chains: supportedChains,
   connectors,
-  transports: {
-    [supportedChains[0].id]: http(),
-    [supportedChains[1].id]: http(),
-  },
+  transports: Object.fromEntries(supportedChains.map((chain) => [chain.id, http()])),
   ssr: true,
 })
