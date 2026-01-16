@@ -2,7 +2,8 @@
   "permissions": {
     "allow": [
       "Bash(npm install:*)",
-      "Bash(forge test:*)"
+      "Bash(forge test:*)",
+      "Bash(forge build:*)"
     ]
   }
 }
