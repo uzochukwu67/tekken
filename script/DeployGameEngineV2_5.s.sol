@@ -3,8 +3,8 @@ pragma solidity ^0.8.20;
 
 import "forge-std/Script.sol";
 import "../src/GameEngineV2_5.sol";
-import "../src/BettingPoolV2.sol";
-import "../src/LiquidityPool.sol";
+import "../src/BettingPoolV2_1.sol";
+import "../src/LiquidityPoolV2.sol";
 import "../src/LeagueToken.sol";
 
 contract DeployGameEngineV2_5 is Script {
@@ -34,17 +34,17 @@ contract DeployGameEngineV2_5 is Script {
         );
         console.log("GameEngine deployed at:", address(gameEngine));
 
-        // 3. Deploy LiquidityPool
-        console.log("\n3. Deploying LiquidityPool...");
-        LiquidityPool liquidityPool = new LiquidityPool(
+        // 3. Deploy LiquidityPoolV2
+        console.log("\n3. Deploying LiquidityPoolV2...");
+        LiquidityPoolV2 liquidityPool = new LiquidityPoolV2(
             address(leagueToken),
             deployer
         );
-        console.log("LiquidityPool deployed at:", address(liquidityPool));
+        console.log("LiquidityPoolV2 deployed at:", address(liquidityPool));
 
-        // 4. Deploy BettingPoolV2
-        console.log("\n4. Deploying BettingPoolV2...");
-        BettingPoolV2 bettingPool = new BettingPoolV2(
+        // 4. Deploy BettingPoolV2_1
+        console.log("\n4. Deploying BettingPoolV2_1...");
+        BettingPoolV2_1 bettingPool = new BettingPoolV2_1(
             address(leagueToken),
             address(gameEngine),
             address(liquidityPool),
@@ -52,12 +52,12 @@ contract DeployGameEngineV2_5 is Script {
             deployer, // rewardsDistributor
             deployer  // initialOwner
         );
-        console.log("BettingPoolV2 deployed at:", address(bettingPool));
+        console.log("BettingPoolV2_1 deployed at:", address(bettingPool));
 
         // 5. Link contracts
         console.log("\n5. Linking contracts...");
         liquidityPool.setAuthorizedCaller(address(bettingPool), true);
-        console.log("LiquidityPool.setAuthorizedCaller() called");
+        console.log("LiquidityPoolV2.setAuthorizedCaller() called");
 
         vm.stopBroadcast();
 
