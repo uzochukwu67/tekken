@@ -1,0 +1,772 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "./interfaces/IGameEngine.sol";
+import "./interfaces/ILiquidityPoolV2.sol";
+
+/**
+ * @title BettingPool - Unified LP Model
+ * @notice Pool-based betting where ALL risk flows through the LP pool
+ *
+ * ARCHITECTURE:
+ * - Protocol earns 5% fee on all bets
+ * - LP pool covers ALL payouts (base + parlay bonuses)
+ * - LP pool funds round seeding (3,000 LEAGUE per round)
+ * - Reduced parlay bonuses (1.0x - 1.25x) for LP safety
+ * - Direct deduction model (wins/losses immediately affect LP value)
+ *
+ * KEY FEATURES:
+ * - ✅ No protocol reserve (unified LP pool only)
+ * - ✅ Protocol can be an LP (equal footing with others)
+ * - ✅ Transparent LP profit/loss tracking
+ * - ✅ AMM-style LP shares (deposit/withdraw anytime)
+ * - ✅ Caps: max bet (10k), max payout (100k), max round (500k)
+ */
+contract BettingPool is Ownable, ReentrancyGuard {
+    // ============ Immutable State ============
+
+    IERC20 public immutable leagueToken;
+    IGameEngine public immutable gameEngine;
+    ILiquidityPoolV2 public immutable liquidityPoolV2;
+    address public immutable protocolTreasury;
+
+    // ============ Mutable State ============
+
+    address public rewardsDistributor;
+    uint256 public seasonRewardPool;
+    uint256 public nextBetId;
+
+    // ============ Constants - Protocol Parameters ============
+
+    uint256 public constant PROTOCOL_FEE = 500; // 5% fee on all bets (in basis points)
+    uint256 public constant WINNER_SHARE = 2500; // 25% of losing pool to winners (max ~25% profit)
+    uint256 public constant SEASON_POOL_SHARE = 200; // 2% to season rewards
+
+    // ============ Constants - Parlay Multipliers (REDUCED for LP safety) ============
+
+    // Linear progression: 1.0x → 1.25x (reduces LP risk by ~50%)
+    uint256 public constant PARLAY_MULTIPLIER_1_MATCH = 1e18;      // 1.0x
+    uint256 public constant PARLAY_MULTIPLIER_2_MATCHES = 105e16;  // 1.05x
+    uint256 public constant PARLAY_MULTIPLIER_3_MATCHES = 11e17;   // 1.10x
+    uint256 public constant PARLAY_MULTIPLIER_4_MATCHES = 113e16;  // 1.13x
+    uint256 public constant PARLAY_MULTIPLIER_5_MATCHES = 116e16;  // 1.16x
+    uint256 public constant PARLAY_MULTIPLIER_6_MATCHES = 119e16;  // 1.19x
+    uint256 public constant PARLAY_MULTIPLIER_7_MATCHES = 121e16;  // 1.21x
+    uint256 public constant PARLAY_MULTIPLIER_8_MATCHES = 123e16;  // 1.23x
+    uint256 public constant PARLAY_MULTIPLIER_9_MATCHES = 124e16;  // 1.24x
+    uint256 public constant PARLAY_MULTIPLIER_10_MATCHES = 125e16; // 1.25x (max)
+
+    // ============ Constants - Seeding ============
+
+    uint256 public constant SEED_HOME_POOL = 120 ether;   // 120 LEAGUE
+    uint256 public constant SEED_AWAY_POOL = 80 ether;    // 80 LEAGUE
+    uint256 public constant SEED_DRAW_POOL = 100 ether;   // 100 LEAGUE
+    uint256 public constant SEED_PER_MATCH = 300 ether;   // 300 LEAGUE total
+    uint256 public constant SEED_PER_ROUND = 3000 ether;  // 3,000 LEAGUE (10 matches)
+
+    // ============ Constants - Risk Management Caps ============
+
+    uint256 public constant MAX_BET_AMOUNT = 10000 ether;    // 10,000 LEAGUE max bet
+    uint256 public constant MAX_PAYOUT_PER_BET = 100000 ether; // 100,000 LEAGUE max payout
+    uint256 public constant MAX_ROUND_PAYOUTS = 500000 ether;  // 500,000 LEAGUE per round
+
+    // ============ Constants - Virtual Liquidity ============
+
+    uint256 public constant VIRTUAL_LIQUIDITY_MULTIPLIER = 60; // 60x dampening
+
+    // ============ Structs ============
+
+    struct MatchPool {
+        uint256 homeWinPool;
+        uint256 awayWinPool;
+        uint256 drawPool;
+        uint256 totalPool;
+    }
+
+    struct RoundAccounting {
+        mapping(uint256 => MatchPool) matchPools;
+
+        uint256 totalBetVolume;
+        uint256 totalWinningPool;
+        uint256 totalLosingPool;
+        uint256 totalReservedForWinners;
+        uint256 totalClaimed;
+        uint256 totalPaidOut; // Includes parlay bonuses
+
+        uint256 protocolFeeCollected; // 5% fees collected this round
+        uint256 seasonRevenueShare;
+        bool revenueDistributed;
+
+        uint256 protocolSeedAmount;
+        bool seeded;
+
+        bool settled;
+        uint256 roundEndTime;
+    }
+
+    struct Prediction {
+        uint256 matchIndex;
+        uint8 predictedOutcome; // 1=HOME, 2=AWAY, 3=DRAW
+        uint256 amountInPool;
+    }
+
+    struct Bet {
+        address bettor;
+        uint256 roundId;
+        uint256 amount; // Original bet amount (before fee)
+        uint256 amountAfterFee; // Amount that went to pools (95%)
+        uint256 lockedMultiplier; // Parlay multiplier locked at placement
+        Prediction[] predictions;
+        bool settled;
+        bool claimed;
+    }
+
+    // ============ Mappings ============
+
+    mapping(uint256 => Bet) public bets;
+    mapping(uint256 => RoundAccounting) public roundAccounting;
+    mapping(address => uint256[]) public userBets;
+
+    // ============ Events ============
+
+    event BetPlaced(
+        uint256 indexed betId,
+        address indexed bettor,
+        uint256 roundId,
+        uint256 amount,
+        uint256 amountAfterFee,
+        uint256 protocolFee,
+        uint256 numLegs,
+        uint256 parlayMultiplier
+    );
+
+    event WinningsClaimed(
+        uint256 indexed betId,
+        address indexed bettor,
+        uint256 basePayout,
+        uint256 parlayMultiplier,
+        uint256 finalPayout
+    );
+
+    event BetLost(uint256 indexed betId, address indexed bettor);
+
+    event RoundSeeded(uint256 indexed roundId, uint256 totalAmount);
+
+    event RoundSettled(
+        uint256 indexed roundId,
+        uint256 totalWinningPool,
+        uint256 totalLosingPool,
+        uint256 totalReservedForWinners
+    );
+
+    event RoundRevenueFinalized(
+        uint256 indexed roundId,
+        uint256 totalCollected,
+        uint256 totalPaid,
+        uint256 profitToLP,
+        uint256 lossFromLP,
+        uint256 seasonShare
+    );
+
+    event ProtocolFeeCollected(uint256 roundId, uint256 amount);
+
+    // ============ Constructor ============
+
+    constructor(
+        address _leagueToken,
+        address _gameEngine,
+        address _liquidityPoolV2,
+        address _protocolTreasury,
+        address _rewardsDistributor,
+        address _initialOwner
+    ) Ownable(_initialOwner) {
+        require(_leagueToken != address(0), "Invalid token");
+        require(_gameEngine != address(0), "Invalid game engine");
+        require(_liquidityPoolV2 != address(0), "Invalid LP pool");
+        require(_protocolTreasury != address(0), "Invalid treasury");
+
+        leagueToken = IERC20(_leagueToken);
+        gameEngine = IGameEngine(_gameEngine);
+        liquidityPoolV2 = ILiquidityPoolV2(_liquidityPoolV2);
+        protocolTreasury = _protocolTreasury;
+        rewardsDistributor = _rewardsDistributor;
+
+        nextBetId = 1;
+    }
+
+    // ============ Seeding Function ============
+
+    /**
+     * @notice Seed round pools from LP pool
+     * @param roundId Round to seed
+     */
+    function seedRoundPools(uint256 roundId) external nonReentrant {
+        require(roundId > 0, "Invalid round");
+
+        // Check round is current and not yet settled
+        uint256 currentRound = gameEngine.getCurrentRound();
+        require(roundId == currentRound, "Round not active");
+        require(!gameEngine.isRoundSettled(roundId), "Round already settled");
+
+        RoundAccounting storage accounting = roundAccounting[roundId];
+        require(!accounting.seeded, "Already seeded");
+
+        // Request seeding from LP pool
+        bool success = liquidityPoolV2.fundSeeding(roundId, SEED_PER_ROUND);
+        require(success, "LP pool cannot fund seeding - insufficient liquidity");
+
+        // Distribute to match pools
+        for (uint256 i = 0; i < 10; i++) {
+            MatchPool storage pool = accounting.matchPools[i];
+            pool.homeWinPool += SEED_HOME_POOL;
+            pool.awayWinPool += SEED_AWAY_POOL;
+            pool.drawPool += SEED_DRAW_POOL;
+            pool.totalPool += SEED_PER_MATCH;
+        }
+
+        accounting.protocolSeedAmount = SEED_PER_ROUND;
+        accounting.seeded = true;
+
+        emit RoundSeeded(roundId, SEED_PER_ROUND);
+    }
+
+    // ============ Betting Function ============
+
+    /**
+     * @notice Place a bet on multiple match outcomes
+     * @param matchIndices Array of match indices (0-9)
+     * @param outcomes Array of predicted outcomes (1=HOME, 2=AWAY, 3=DRAW)
+     * @param amount Total LEAGUE to bet (5% fee will be deducted)
+     */
+    function placeBet(
+        uint256[] calldata matchIndices,
+        uint8[] calldata outcomes,
+        uint256 amount
+    ) external nonReentrant returns (uint256 betId) {
+        require(amount > 0, "Amount must be > 0");
+        require(amount <= MAX_BET_AMOUNT, "Bet exceeds maximum");
+        require(matchIndices.length == outcomes.length, "Array length mismatch");
+        require(matchIndices.length > 0 && matchIndices.length <= 10, "Invalid bet count");
+
+        uint256 currentRoundId = gameEngine.getCurrentRound();
+        require(currentRoundId > 0, "No active round");
+        require(!gameEngine.isRoundSettled(currentRoundId), "Round already settled");
+
+        // Transfer user's stake
+        require(
+            leagueToken.transferFrom(msg.sender, address(this), amount),
+            "Transfer failed"
+        );
+
+        RoundAccounting storage accounting = roundAccounting[currentRoundId];
+
+        // Deduct 5% protocol fee
+        uint256 protocolFee = (amount * PROTOCOL_FEE) / 10000;
+        uint256 amountAfterFee = amount - protocolFee;
+
+        // Transfer fee to treasury
+        require(
+            leagueToken.transfer(protocolTreasury, protocolFee),
+            "Fee transfer failed"
+        );
+
+        accounting.protocolFeeCollected += protocolFee;
+
+        // Get parlay multiplier
+        uint256 parlayMultiplier = _getParlayMultiplier(matchIndices.length);
+
+        // Check LP pool can cover max possible payout
+        uint256 maxPossiblePayout = _calculateMaxPayout(amountAfterFee, matchIndices.length, parlayMultiplier);
+        require(
+            liquidityPoolV2.canCoverPayout(maxPossiblePayout),
+            "Insufficient LP liquidity for this bet"
+        );
+
+        // Assign bet ID
+        betId = nextBetId++;
+
+        // Store bet
+        Bet storage bet = bets[betId];
+        bet.bettor = msg.sender;
+        bet.roundId = currentRoundId;
+        bet.amount = amount;
+        bet.amountAfterFee = amountAfterFee;
+        bet.lockedMultiplier = parlayMultiplier;
+        bet.settled = false;
+        bet.claimed = false;
+
+        // Split bet across matches
+        uint256 perMatch = amountAfterFee / matchIndices.length;
+        uint256 remainder = amountAfterFee % matchIndices.length;
+
+        // Pseudo-random remainder distribution
+        uint256 remainderIndex = uint256(
+            keccak256(abi.encodePacked(betId, msg.sender, block.timestamp))
+        ) % matchIndices.length;
+
+        // Add predictions and update pools
+        for (uint256 i = 0; i < matchIndices.length; i++) {
+            uint256 matchIndex = matchIndices[i];
+            uint8 outcome = outcomes[i];
+
+            require(matchIndex < 10, "Invalid match index");
+            require(outcome >= 1 && outcome <= 3, "Invalid outcome");
+
+            uint256 allocation = perMatch + (i == remainderIndex ? remainder : 0);
+
+            MatchPool storage pool = accounting.matchPools[matchIndex];
+
+            if (outcome == 1) {
+                pool.homeWinPool += allocation;
+            } else if (outcome == 2) {
+                pool.awayWinPool += allocation;
+            } else {
+                pool.drawPool += allocation;
+            }
+            pool.totalPool += allocation;
+
+            bet.predictions.push(Prediction({
+                matchIndex: matchIndex,
+                predictedOutcome: outcome,
+                amountInPool: allocation
+            }));
+        }
+
+        accounting.totalBetVolume += amountAfterFee;
+        userBets[msg.sender].push(betId);
+
+        emit BetPlaced(
+            betId,
+            msg.sender,
+            currentRoundId,
+            amount,
+            amountAfterFee,
+            protocolFee,
+            matchIndices.length,
+            parlayMultiplier
+        );
+
+        return betId;
+    }
+
+    // ============ Claiming Function ============
+
+    /**
+     * @notice Claim winnings for a bet
+     * @param betId The bet ID to claim
+     */
+    function claimWinnings(uint256 betId) external nonReentrant {
+        Bet storage bet = bets[betId];
+        require(bet.bettor == msg.sender, "Not your bet");
+        require(!bet.claimed, "Already claimed");
+
+        RoundAccounting storage accounting = roundAccounting[bet.roundId];
+        require(accounting.settled, "Round not settled");
+
+        // Calculate payout
+        (bool won, uint256 basePayout, uint256 finalPayout) = _calculateBetPayout(betId);
+
+        bet.claimed = true;
+        bet.settled = true;
+
+        if (won && finalPayout > 0) {
+            // Check per-round payout cap
+            require(
+                accounting.totalPaidOut + finalPayout <= MAX_ROUND_PAYOUTS,
+                "Round payout limit reached"
+            );
+
+            accounting.totalClaimed += finalPayout;
+            accounting.totalPaidOut += finalPayout;
+
+            // Pay from LP pool
+            liquidityPoolV2.payWinner(msg.sender, finalPayout);
+
+            emit WinningsClaimed(betId, msg.sender, basePayout, bet.lockedMultiplier, finalPayout);
+        } else {
+            emit BetLost(betId, msg.sender);
+        }
+    }
+
+    // ============ Settlement Functions ============
+
+    /**
+     * @notice Settle round after VRF generates results
+     * @param roundId The round to settle
+     */
+    function settleRound(uint256 roundId) external nonReentrant {
+        require(gameEngine.isRoundSettled(roundId), "Round not settled in GameEngine");
+
+        RoundAccounting storage accounting = roundAccounting[roundId];
+        require(!accounting.settled, "Already settled");
+
+        // Calculate winning and losing pools
+        for (uint256 matchIndex = 0; matchIndex < 10; matchIndex++) {
+            IGameEngine.Match memory matchResult = gameEngine.getMatch(roundId, matchIndex);
+            MatchPool storage pool = accounting.matchPools[matchIndex];
+
+            IGameEngine.MatchOutcome winningOutcome = matchResult.outcome;
+            uint256 winningPool;
+            uint256 losingPool;
+
+            if (winningOutcome == IGameEngine.MatchOutcome.HOME_WIN) {
+                winningPool = pool.homeWinPool;
+                losingPool = pool.awayWinPool + pool.drawPool;
+            } else if (winningOutcome == IGameEngine.MatchOutcome.AWAY_WIN) {
+                winningPool = pool.awayWinPool;
+                losingPool = pool.homeWinPool + pool.drawPool;
+            } else {
+                winningPool = pool.drawPool;
+                losingPool = pool.homeWinPool + pool.awayWinPool;
+            }
+
+            accounting.totalWinningPool += winningPool;
+            accounting.totalLosingPool += losingPool;
+        }
+
+        // Calculate total owed to winners (base payouts only)
+        accounting.totalReservedForWinners = _calculateTotalWinningPayouts(roundId);
+
+        accounting.settled = true;
+        accounting.roundEndTime = block.timestamp;
+
+        emit RoundSettled(
+            roundId,
+            accounting.totalWinningPool,
+            accounting.totalLosingPool,
+            accounting.totalReservedForWinners
+        );
+    }
+
+    /**
+     * @notice Finalize round revenue and return profits to LP pool
+     * @param roundId The round to finalize
+     */
+    function finalizeRoundRevenue(uint256 roundId) external nonReentrant {
+        RoundAccounting storage accounting = roundAccounting[roundId];
+        require(accounting.settled, "Round not settled");
+        require(!accounting.revenueDistributed, "Already distributed");
+
+        // Calculate round P&L
+        // Total funds in contract = user bets (after fees) + LP seeding
+        uint256 totalInContract = accounting.totalBetVolume + accounting.protocolSeedAmount;
+        uint256 totalPaid = accounting.totalPaidOut; // Includes parlay bonuses
+
+        uint256 profitToLP = 0;
+        uint256 lossFromLP = 0;
+
+        if (totalInContract > totalPaid) {
+            // Round was profitable - return all remaining funds to LP pool
+            profitToLP = totalInContract - totalPaid;
+
+            // Transfer back to LP pool
+            require(
+                leagueToken.approve(address(liquidityPoolV2), profitToLP),
+                "Approval failed"
+            );
+            liquidityPoolV2.collectLosingBet(profitToLP);
+        } else if (totalPaid > totalInContract) {
+            // Round was unprofitable - LP already absorbed loss
+            lossFromLP = totalPaid - totalInContract;
+            // No action needed, LP pool already paid out
+        }
+
+        // Optional: Season pool allocation from collected bets
+        uint256 seasonShare = (accounting.totalBetVolume * SEASON_POOL_SHARE) / 10000;
+        if (seasonShare > 0 && profitToLP > seasonShare) {
+            // Deduct from profit being returned to LP
+            profitToLP -= seasonShare;
+            seasonRewardPool += seasonShare;
+        }
+
+        accounting.seasonRevenueShare = seasonShare;
+        accounting.revenueDistributed = true;
+
+        emit RoundRevenueFinalized(
+            roundId,
+            totalInContract,
+            totalPaid,
+            profitToLP,
+            lossFromLP,
+            seasonShare
+        );
+
+        emit ProtocolFeeCollected(roundId, accounting.protocolFeeCollected);
+    }
+
+    // ============ Internal Helper Functions ============
+
+    /**
+     * @notice Get parlay multiplier based on number of matches
+     */
+    function _getParlayMultiplier(uint256 numMatches)
+        internal
+        pure
+        returns (uint256 multiplier)
+    {
+        if (numMatches == 1) return PARLAY_MULTIPLIER_1_MATCH;
+        if (numMatches == 2) return PARLAY_MULTIPLIER_2_MATCHES;
+        if (numMatches == 3) return PARLAY_MULTIPLIER_3_MATCHES;
+        if (numMatches == 4) return PARLAY_MULTIPLIER_4_MATCHES;
+        if (numMatches == 5) return PARLAY_MULTIPLIER_5_MATCHES;
+        if (numMatches == 6) return PARLAY_MULTIPLIER_6_MATCHES;
+        if (numMatches == 7) return PARLAY_MULTIPLIER_7_MATCHES;
+        if (numMatches == 8) return PARLAY_MULTIPLIER_8_MATCHES;
+        if (numMatches == 9) return PARLAY_MULTIPLIER_9_MATCHES;
+        return PARLAY_MULTIPLIER_10_MATCHES; // 10+ matches
+    }
+
+    /**
+     * @notice Calculate maximum possible payout for LP pool check
+     */
+    function _calculateMaxPayout(
+        uint256 amountAfterFee,
+        uint256 numLegs,
+        uint256 parlayMultiplier
+    ) internal pure returns (uint256) {
+        // Worst case: 2x base payout per leg
+        uint256 maxBasePayout = amountAfterFee * (2 ** numLegs);
+
+        // Apply parlay multiplier
+        uint256 maxFinalPayout = (maxBasePayout * parlayMultiplier) / 1e18;
+
+        // Apply max payout cap
+        if (maxFinalPayout > MAX_PAYOUT_PER_BET) {
+            return MAX_PAYOUT_PER_BET;
+        }
+
+        return maxFinalPayout;
+    }
+
+    /**
+     * @notice Calculate bet payout with parlay multiplier
+     */
+    function _calculateBetPayout(uint256 betId)
+        internal
+        view
+        returns (bool won, uint256 basePayout, uint256 finalPayout)
+    {
+        Bet storage bet = bets[betId];
+        RoundAccounting storage accounting = roundAccounting[bet.roundId];
+
+        bool allCorrect = true;
+        uint256 totalBasePayout = 0;
+
+        for (uint256 i = 0; i < bet.predictions.length; i++) {
+            Prediction memory pred = bet.predictions[i];
+            IGameEngine.Match memory matchResult = gameEngine.getMatch(
+                bet.roundId,
+                pred.matchIndex
+            );
+
+            // Check if prediction is correct
+            IGameEngine.MatchOutcome predictedEnum;
+            if (pred.predictedOutcome == 1) predictedEnum = IGameEngine.MatchOutcome.HOME_WIN;
+            else if (pred.predictedOutcome == 2) predictedEnum = IGameEngine.MatchOutcome.AWAY_WIN;
+            else predictedEnum = IGameEngine.MatchOutcome.DRAW;
+
+            if (matchResult.outcome != predictedEnum) {
+                allCorrect = false;
+                break;
+            }
+
+            // Calculate payout for this match
+            MatchPool storage pool = accounting.matchPools[pred.matchIndex];
+            uint256 winningPool = _getWinningPoolAmount(pool, pred.predictedOutcome);
+            uint256 losingPool = pool.totalPool - winningPool;
+
+            if (winningPool == 0) {
+                totalBasePayout += pred.amountInPool;
+                continue;
+            }
+
+            // User gets 55% of losing pool proportionally
+            uint256 distributedLosingPool = (losingPool * WINNER_SHARE) / 10000;
+            uint256 multiplier = 1e18 + (distributedLosingPool * 1e18) / winningPool;
+            uint256 matchPayout = (pred.amountInPool * multiplier) / 1e18;
+
+            totalBasePayout += matchPayout;
+        }
+
+        if (!allCorrect) {
+            return (false, 0, 0);
+        }
+
+        // Apply locked parlay multiplier
+        uint256 totalFinalPayout = (totalBasePayout * bet.lockedMultiplier) / 1e18;
+
+        // Apply max payout cap
+        if (totalFinalPayout > MAX_PAYOUT_PER_BET) {
+            totalFinalPayout = MAX_PAYOUT_PER_BET;
+        }
+
+        return (true, totalBasePayout, totalFinalPayout);
+    }
+
+    /**
+     * @notice Calculate total payouts owed to all winners (base only)
+     */
+    function _calculateTotalWinningPayouts(uint256 roundId)
+        internal
+        view
+        returns (uint256 totalOwed)
+    {
+        RoundAccounting storage accounting = roundAccounting[roundId];
+
+        for (uint256 matchIndex = 0; matchIndex < 10; matchIndex++) {
+            IGameEngine.Match memory matchResult = gameEngine.getMatch(roundId, matchIndex);
+            MatchPool storage pool = accounting.matchPools[matchIndex];
+
+            IGameEngine.MatchOutcome winningOutcome = matchResult.outcome;
+            if (winningOutcome == IGameEngine.MatchOutcome.PENDING) continue;
+
+            uint8 outcomeAsUint8;
+            if (winningOutcome == IGameEngine.MatchOutcome.HOME_WIN) outcomeAsUint8 = 1;
+            else if (winningOutcome == IGameEngine.MatchOutcome.AWAY_WIN) outcomeAsUint8 = 2;
+            else outcomeAsUint8 = 3;
+
+            uint256 winningPool = _getWinningPoolAmount(pool, outcomeAsUint8);
+            uint256 losingPool = pool.totalPool - winningPool;
+
+            if (winningPool == 0) continue;
+
+            uint256 distributedLosingPool = (losingPool * WINNER_SHARE) / 10000;
+            uint256 totalOwedForMatch = winningPool + distributedLosingPool;
+            totalOwed += totalOwedForMatch;
+        }
+
+        return totalOwed;
+    }
+
+    /**
+     * @notice Get winning pool amount for outcome
+     */
+    function _getWinningPoolAmount(MatchPool storage pool, uint8 outcome)
+        internal
+        view
+        returns (uint256)
+    {
+        if (outcome == 1) return pool.homeWinPool;
+        if (outcome == 2) return pool.awayWinPool;
+        return pool.drawPool;
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get bet details
+     */
+    function getBet(uint256 betId)
+        external
+        view
+        returns (
+            address bettor,
+            uint256 roundId,
+            uint256 amount,
+            uint256 amountAfterFee,
+            uint256 lockedMultiplier,
+            bool settled,
+            bool claimed
+        )
+    {
+        Bet storage bet = bets[betId];
+        return (
+            bet.bettor,
+            bet.roundId,
+            bet.amount,
+            bet.amountAfterFee,
+            bet.lockedMultiplier,
+            bet.settled,
+            bet.claimed
+        );
+    }
+
+    /**
+     * @notice Preview bet payout
+     */
+    function previewBetPayout(uint256 betId)
+        external
+        view
+        returns (bool won, uint256 basePayout, uint256 finalPayout)
+    {
+        return _calculateBetPayout(betId);
+    }
+
+    /**
+     * @notice Get user's bets
+     */
+    function getUserBets(address user) external view returns (uint256[] memory) {
+        return userBets[user];
+    }
+
+    /**
+     * @notice Get match pool for a round
+     */
+    function getMatchPool(uint256 roundId, uint256 matchIndex)
+        external
+        view
+        returns (uint256 homeWinPool, uint256 awayWinPool, uint256 drawPool, uint256 totalPool)
+    {
+        MatchPool storage pool = roundAccounting[roundId].matchPools[matchIndex];
+        return (pool.homeWinPool, pool.awayWinPool, pool.drawPool, pool.totalPool);
+    }
+
+    /**
+     * @notice Get round accounting summary
+     */
+    function getRoundSummary(uint256 roundId)
+        external
+        view
+        returns (
+            uint256 totalBetVolume,
+            uint256 totalWinningPool,
+            uint256 totalLosingPool,
+            uint256 totalPaidOut,
+            uint256 protocolFeeCollected,
+            bool settled,
+            bool revenueDistributed
+        )
+    {
+        RoundAccounting storage accounting = roundAccounting[roundId];
+        return (
+            accounting.totalBetVolume,
+            accounting.totalWinningPool,
+            accounting.totalLosingPool,
+            accounting.totalPaidOut,
+            accounting.protocolFeeCollected,
+            accounting.settled,
+            accounting.revenueDistributed
+        );
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Update rewards distributor
+     */
+    function setRewardsDistributor(address _rewardsDistributor) external onlyOwner {
+        rewardsDistributor = _rewardsDistributor;
+    }
+
+    /**
+     * @notice Withdraw season rewards (for distribution)
+     */
+    function withdrawSeasonRewards(uint256 amount) external {
+        require(msg.sender == rewardsDistributor || msg.sender == owner(), "Unauthorized");
+        require(amount <= seasonRewardPool, "Insufficient season rewards");
+
+        seasonRewardPool -= amount;
+        require(leagueToken.transfer(rewardsDistributor, amount), "Transfer failed");
+    }
+
+    /**
+     * @notice Emergency token recovery (non-LEAGUE only)
+     */
+    function recoverERC20(address token, uint256 amount) external onlyOwner {
+        require(token != address(leagueToken), "Cannot recover LEAGUE");
+        IERC20(token).transfer(owner(), amount);
+    }
+}

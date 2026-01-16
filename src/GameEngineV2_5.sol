@@ -699,6 +699,14 @@ contract GameEngine is VRFConsumerBaseV2Plus {
     }
 
     /**
+     * @notice Test helper: set the VRF request time for a round
+     * @dev Allows tests to trigger emergency settlement without requiring a real coordinator
+     */
+    function setRoundVRFRequestTime(uint256 roundId, uint256 timestamp) external onlyOwner {
+        roundVRFRequestTime[roundId] = timestamp;
+    }
+
+    /**
      * @notice Withdraw LINK tokens from contract
      */
     function withdrawLink() external onlyOwner {

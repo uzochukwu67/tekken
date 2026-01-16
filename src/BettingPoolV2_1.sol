@@ -1,0 +1,1489 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "./interfaces/IGameEngine.sol";
+import "./interfaces/ILiquidityPoolV2.sol";
+
+/**
+ * @title BettingPoolV2.1 - Unified LP Pool Model
+ * @notice Pool-based betting system where ALL risk flows through LP pool
+ * @dev NEW ARCHITECTURE:
+ *      - Protocol earns 5% fee on all bets
+ *      - LP pool covers ALL payouts (base + parlay bonuses)
+ *      - LP pool funds round seeding (3k per round)
+ *      - Reduced parlay bonuses (1.25x max) for LP safety
+ *      - AMM-style LP shares (deposit/withdraw anytime)
+ *
+ * KEY FEATURES:
+ * - ✅ Unified LP pool (no separate protocol reserve)
+ * - ✅ Direct deduction model (losses immediately reduce LP value)
+ * - ✅ 5% protocol fee on every bet
+ * - ✅ Reduced parlay multipliers (1.0x - 1.25x)
+ * - ✅ Max bet, max payout, and per-round caps
+ */
+contract BettingPoolV2_1 is Ownable, ReentrancyGuard {
+    // ============ State Variables ============
+
+    IERC20 public immutable leagueToken;
+    IGameEngine public immutable gameEngine;
+    ILiquidityPoolV2 public immutable liquidityPoolV2;
+
+    address public immutable protocolTreasury;
+    address public rewardsDistributor;
+
+    // NEW: Protocol fee model (5% on all bets)
+    uint256 public constant PROTOCOL_FEE = 500; // 5% fee in basis points
+    uint256 public constant WINNER_SHARE = 2500; // 25% distributed to winners (REDUCED for LP safety)
+    uint256 public constant SEASON_POOL_SHARE = 200; // 2% for season rewards
+
+    // Multibet stake bonus rates (basis points) - added to pool
+    uint256 public constant BONUS_2_MATCH = 500;   // 5%
+    uint256 public constant BONUS_3_MATCH = 1000;  // 10%
+    uint256 public constant BONUS_4_PLUS = 2000;   // 20%
+
+    // Parlay payout multipliers (1e18 scale) - UPDATED to match-based linear scaling
+    // REDUCED Linear progression: 1.05x (2 matches) to 1.25x (10 matches) for LP safety
+    // Reduces LP risk by ~50% while keeping parlays attractive
+    uint256 public constant PARLAY_MULTIPLIER_1_MATCH = 1e18;      // 1.0x (no bonus)
+    uint256 public constant PARLAY_MULTIPLIER_2_MATCHES = 105e16;  // 1.05x (was 1.15x)
+    uint256 public constant PARLAY_MULTIPLIER_3_MATCHES = 11e17;   // 1.10x (was 1.194x)
+    uint256 public constant PARLAY_MULTIPLIER_4_MATCHES = 113e16;  // 1.13x (was 1.238x)
+    uint256 public constant PARLAY_MULTIPLIER_5_MATCHES = 116e16;  // 1.16x (was 1.281x)
+    uint256 public constant PARLAY_MULTIPLIER_6_MATCHES = 119e16;  // 1.19x (was 1.325x)
+    uint256 public constant PARLAY_MULTIPLIER_7_MATCHES = 121e16;  // 1.21x (was 1.369x)
+    uint256 public constant PARLAY_MULTIPLIER_8_MATCHES = 123e16;  // 1.23x (was 1.413x)
+    uint256 public constant PARLAY_MULTIPLIER_9_MATCHES = 124e16;  // 1.24x (was 1.456x)
+    uint256 public constant PARLAY_MULTIPLIER_10_MATCHES = 125e16; // 1.25x (was 1.5x)
+
+    // Protocol seeding per match (REDUCED 75% per Logic2.md simulation)
+    uint256 public constant SEED_HOME_POOL = 120 ether;   // Favorite (was 500)
+    uint256 public constant SEED_AWAY_POOL = 80 ether;    // Underdog (was 300)
+    uint256 public constant SEED_DRAW_POOL = 100 ether;   // Middle (was 400)
+    uint256 public constant SEED_PER_MATCH = 300 ether;   // Total per match (was 1200)
+    uint256 public constant SEED_PER_ROUND = SEED_PER_MATCH * 10; // 3,000 LEAGUE (was 12,000)
+
+    // Virtual liquidity for odds dampening (NEW - prevents extreme price swings)
+    // Pools behave like they have 60x more liquidity, ensuring odds stay within ±0.5x even with 5000 LEAGUE bet volume
+    uint256 public constant VIRTUAL_LIQUIDITY_MULTIPLIER = 60;
+
+    // Liquidity-aware parlay parameters (NEW per Logic2.md)
+    uint256 public constant MIN_IMBALANCE_FOR_FULL_BONUS = 4000; // 40% in basis points
+    uint256 public constant MIN_PARLAY_MULTIPLIER = 11e17; // 1.1x minimum
+
+    // Count-based parlay tiers (PRIMARY FOMO mechanism) - NEW!
+    uint256 public constant COUNT_TIER_1 = 10;   // First 10 parlays
+    uint256 public constant COUNT_TIER_2 = 20;   // Parlays 11-20
+    uint256 public constant COUNT_TIER_3 = 30;   // Parlays 21-30
+    uint256 public constant COUNT_TIER_4 = 40;   // Parlays 31-40
+    // Tier 5: 41+ parlays
+
+    // Count-based multipliers (decreasing with each tier)
+    uint256 public constant COUNT_MULT_TIER_1 = 25e17;  // 2.5x (first 10)
+    uint256 public constant COUNT_MULT_TIER_2 = 22e17;  // 2.2x (next 10)
+    uint256 public constant COUNT_MULT_TIER_3 = 19e17;  // 1.9x (next 10)
+    uint256 public constant COUNT_MULT_TIER_4 = 16e17;  // 1.6x (next 10)
+    uint256 public constant COUNT_MULT_TIER_5 = 13e17;  // 1.3x (41+)
+
+    // Reserve-based multiplier decay (SECONDARY safety valve) - NEW!
+    uint256 public constant RESERVE_TIER_1 = 100000 ether;  // 0-100k locked reserve
+    uint256 public constant RESERVE_TIER_2 = 250000 ether;  // 100k-250k locked reserve
+    uint256 public constant RESERVE_TIER_3 = 500000 ether;  // 250k-500k locked reserve
+    // Tier 4: 500k+ locked reserve
+
+    // Multiplier decay per tier (applied as percentage of base multiplier)
+    uint256 public constant TIER_1_DECAY = 10000; // 100% (no decay)
+    uint256 public constant TIER_2_DECAY = 8800;  // 88% (12% decay)
+    uint256 public constant TIER_3_DECAY = 7600;  // 76% (24% decay)
+    uint256 public constant TIER_4_DECAY = 6400;  // 64% (36% decay)
+
+    // ============ RISK MANAGEMENT CAPS (CRITICAL) ============
+    // These caps protect protocol reserve from catastrophic depletion
+    uint256 public constant MAX_BET_AMOUNT = 10000 ether; // 10,000 LEAGUE max bet
+    uint256 public constant MAX_PAYOUT_PER_BET = 100000 ether; // 100,000 LEAGUE max payout
+    uint256 public constant MAX_ROUND_PAYOUTS = 500000 ether; // 500,000 LEAGUE per round
+
+    // REMOVED: protocolReserve (now handled by LP pool)
+    // REMOVED: lockedParlayReserve (LP pool covers all payouts)
+    uint256 public seasonRewardPool;
+    uint256 public nextBetId;
+
+    // ============ Structs ============
+
+    struct MatchPool {
+        uint256 homeWinPool;    // Total LEAGUE bet on HOME_WIN (outcome 1)
+        uint256 awayWinPool;    // Total LEAGUE bet on AWAY_WIN (outcome 2)
+        uint256 drawPool;       // Total LEAGUE bet on DRAW (outcome 3)
+        uint256 totalPool;      // Sum of all three pools
+    }
+
+    struct RoundAccounting {
+        // Match-level pools (10 matches per round)
+        mapping(uint256 => MatchPool) matchPools;
+
+        // Round totals
+        uint256 totalBetVolume;         // Total LEAGUE bet in this round
+        uint256 totalWinningPool;       // Sum of all winning outcome pools (after settlement)
+        uint256 totalLosingPool;        // Sum of all losing outcome pools
+        uint256 totalReservedForWinners; // Total owed to winners (calculated from pools)
+        uint256 totalClaimed;            // Total LEAGUE claimed so far
+        uint256 totalPaidOut;            // Total LEAGUE paid out (including parlay bonuses) - NEW
+
+        // Revenue distribution
+        uint256 protocolRevenueShare;   // Protocol's share of net revenue
+        uint256 lpRevenueShare;          // LP's share of net revenue
+        uint256 seasonRevenueShare;      // Season pool share
+        bool revenueDistributed;         // Has revenue been distributed?
+
+        // Seeding tracking - NEW!
+        uint256 protocolSeedAmount;      // Total LEAGUE seeded by protocol
+        bool seeded;                     // Has round been seeded?
+
+        // Parlay count tracking (for count-based tiers) - NEW!
+        uint256 parlayCount;             // Number of parlays placed this round
+
+        // Timestamps
+        uint256 roundStartTime;
+        uint256 roundEndTime;
+        bool settled;
+    }
+
+    struct Prediction {
+        uint256 matchIndex;         // 0-9
+        uint8 predictedOutcome;     // 1=HOME_WIN, 2=AWAY_WIN, 3=DRAW
+        uint256 amountInPool;       // How much LEAGUE was added to this pool
+    }
+
+    struct Bet {
+        address bettor;
+        uint256 roundId;
+        uint256 amount;             // User's stake (without bonus)
+        uint256 bonus;              // Protocol stake bonus added to pools
+        uint256 lockedMultiplier;   // Parlay multiplier locked at bet placement (CRITICAL FIX)
+        Prediction[] predictions;   // Match predictions
+        bool settled;               // Has round been settled?
+        bool claimed;               // Has user claimed winnings?
+    }
+
+    // ============ Mappings ============
+
+    mapping(uint256 => RoundAccounting) public roundAccounting;
+    mapping(uint256 => Bet) public bets;
+    mapping(address => uint256[]) public userBets;
+    mapping(uint256 => uint256) public betParlayReserve;  // NEW: betId => reserved parlay bonus
+
+    // ============ Events ============
+
+    event BetPlaced(
+        uint256 indexed betId,
+        address indexed bettor,
+        uint256 indexed roundId,
+        uint256 amount,
+        uint256 bonus,
+        uint256 parlayMultiplier,  // NEW
+        uint256[] matchIndices,
+        uint8[] outcomes
+    );
+
+    event RoundSeeded(
+        uint256 indexed roundId,
+        uint256 totalSeedAmount
+    );
+
+    event RoundSettled(
+        uint256 indexed roundId,
+        uint256 totalWinningPool,
+        uint256 totalLosingPool,
+        uint256 totalReserved
+    );
+
+    event WinningsClaimed(
+        uint256 indexed betId,
+        address indexed bettor,
+        uint256 basePayout,
+        uint256 parlayMultiplier,
+        uint256 finalPayout
+    );
+
+    event BetLost(uint256 indexed betId, address indexed bettor);
+
+    event ParlayBonusReleased(
+        uint256 indexed betId,
+        uint256 reservedAmount,
+        uint256 actualBonus
+    );
+
+    event RoundRevenueFinalized(
+        uint256 indexed roundId,
+        uint256 netRevenue,
+        uint256 toProtocol,
+        uint256 toLP,
+        uint256 toSeason,
+        uint256 seedRecovered
+    );
+
+    event ProtocolReserveFunded(address indexed funder, uint256 amount);
+
+    // ============ Constructor ============
+
+    constructor(
+        address _leagueToken,
+        address _gameEngine,
+        address _liquidityPool,
+        address _protocolTreasury,
+        address _rewardsDistributor,
+        address _initialOwner
+    ) Ownable(_initialOwner) {
+        require(_leagueToken != address(0), "Invalid token");
+        require(_gameEngine != address(0), "Invalid game engine");
+        require(_liquidityPool != address(0), "Invalid liquidity pool");
+
+        leagueToken = IERC20(_leagueToken);
+        gameEngine = IGameEngine(_gameEngine);
+        liquidityPool = ILiquidityPool(_liquidityPool);
+        protocolTreasury = _protocolTreasury;
+        rewardsDistributor = _rewardsDistributor;
+    }
+
+    // ============ Seeding Functions ============
+
+    /**
+     * @notice Calculate differentiated seed amounts for a match (HYBRID MODEL)
+     * @dev Round 1-3: Pseudo-random based on team IDs (no stats yet)
+     *      Round 4+: Stats-based using actual team performance
+     * @param roundId The round ID
+     * @param matchIndex The match index (0-9)
+     * @return homeSeed Amount to seed home pool
+     * @return awaySeed Amount to seed away pool
+     * @return drawSeed Amount to seed draw pool
+     */
+    function _calculateMatchSeeds(uint256 roundId, uint256 matchIndex)
+        internal
+        view
+        returns (uint256 homeSeed, uint256 awaySeed, uint256 drawSeed)
+    {
+        // Get match from game engine
+        IGameEngine.Match memory matchData = gameEngine.getMatch(roundId, matchIndex);
+        uint256 homeTeamId = matchData.homeTeamId;
+        uint256 awayTeamId = matchData.awayTeamId;
+
+        // Get current season info
+        uint256 seasonId = gameEngine.getCurrentSeason();
+        IGameEngine.Season memory season = gameEngine.getSeason(seasonId);
+        uint256 seasonRound = season.currentRound;
+
+        // Use pseudo-random for first 3 rounds (no meaningful stats yet)
+        if (seasonRound <= 3) {
+            return _calculatePseudoRandomSeeds(homeTeamId, awayTeamId, roundId);
+        }
+
+        // Use actual team stats from round 4 onwards
+        return _calculateStatsBasedSeeds(seasonId, homeTeamId, awayTeamId);
+    }
+
+    /**
+     * @notice Calculate seeds using pseudo-random distribution (for early rounds)
+     * @dev Deterministic but varied based on team IDs
+     */
+    function _calculatePseudoRandomSeeds(
+        uint256 homeTeamId,
+        uint256 awayTeamId,
+        uint256 roundId
+    )
+        internal
+        pure
+        returns (uint256 homeSeed, uint256 awaySeed, uint256 drawSeed)
+    {
+        // Generate deterministic pseudo-random seed
+        uint256 seed = uint256(
+            keccak256(abi.encodePacked(homeTeamId, awayTeamId, roundId))
+        );
+
+        // Extract strength values (0-99)
+        uint256 homeStrength = (seed >> 0) % 100;
+        uint256 awayStrength = (seed >> 8) % 100;
+        uint256 drawBias = (seed >> 16) % 100;
+
+        uint256 totalSeed = SEED_PER_MATCH; // 300 LEAGUE
+
+        // Calculate absolute difference
+        uint256 diff = homeStrength > awayStrength
+            ? homeStrength - awayStrength
+            : awayStrength - homeStrength;
+
+        if (diff > 30) {
+            // Lopsided match (strong favorite)
+            if (homeStrength > awayStrength) {
+                homeSeed = (totalSeed * 50) / 100;  // 150 LEAGUE → 1.2x odds
+                awaySeed = (totalSeed * 25) / 100;  //  75 LEAGUE → 1.8x odds
+                drawSeed = (totalSeed * 25) / 100;  //  75 LEAGUE → 1.8x odds
+            } else {
+                homeSeed = (totalSeed * 25) / 100;
+                awaySeed = (totalSeed * 50) / 100;
+                drawSeed = (totalSeed * 25) / 100;
+            }
+        } else if (diff <= 10) {
+            // Balanced match
+            homeSeed = (totalSeed * 35) / 100;  // 105 LEAGUE → 1.43x odds
+            awaySeed = (totalSeed * 35) / 100;
+            drawSeed = (totalSeed * 30) / 100;
+        } else {
+            // Moderate favorite
+            if (homeStrength > awayStrength) {
+                homeSeed = (totalSeed * 40) / 100;  // 120 LEAGUE → 1.33x odds
+                awaySeed = (totalSeed * 27) / 100;
+                drawSeed = (totalSeed * 33) / 100;
+            } else {
+                homeSeed = (totalSeed * 27) / 100;
+                awaySeed = (totalSeed * 40) / 100;
+                drawSeed = (totalSeed * 33) / 100;
+            }
+        }
+
+        // Apply draw bias for defensive matchups
+        if (drawBias > 75) {
+            uint256 drawBoost = (drawSeed * 30) / 100;
+            drawSeed += drawBoost;
+            homeSeed -= drawBoost / 2;
+            awaySeed -= drawBoost / 2;
+        }
+
+        return (homeSeed, awaySeed, drawSeed);
+    }
+
+    /**
+     * @notice Calculate seeds using actual team stats (for mid-late season)
+     * @dev Uses points, goal difference, and form to determine realistic odds
+     */
+    function _calculateStatsBasedSeeds(
+        uint256 seasonId,
+        uint256 homeTeamId,
+        uint256 awayTeamId
+    )
+        internal
+        view
+        returns (uint256 homeSeed, uint256 awaySeed, uint256 drawSeed)
+    {
+        // Get team stats from game engine
+        IGameEngine.Team memory homeTeam = gameEngine.getTeamStanding(seasonId, homeTeamId);
+        IGameEngine.Team memory awayTeam = gameEngine.getTeamStanding(seasonId, awayTeamId);
+
+        uint256 totalSeed = SEED_PER_MATCH; // 300 LEAGUE
+
+        // Calculate adjusted points (home advantage: +10%)
+        uint256 adjustedHomePoints = (homeTeam.points * 110) / 100;
+        uint256 totalPoints = adjustedHomePoints + awayTeam.points;
+
+        if (totalPoints == 0) {
+            // Fallback if no data
+            return (120 ether, 80 ether, 100 ether);
+        }
+
+        // Calculate goal difference
+        int256 homeGD = int256(homeTeam.goalsFor) - int256(homeTeam.goalsAgainst);
+        int256 awayGD = int256(awayTeam.goalsFor) - int256(awayTeam.goalsAgainst);
+
+        // Calculate point difference for draw probability
+        uint256 pointDiff = adjustedHomePoints > awayTeam.points
+            ? adjustedHomePoints - awayTeam.points
+            : awayTeam.points - adjustedHomePoints;
+
+        // Determine draw seed based on closeness
+        uint256 baseDrawSeed;
+        if (pointDiff <= 3) {
+            baseDrawSeed = (totalSeed * 40) / 100;  // Very close → More draws
+        } else if (pointDiff <= 6) {
+            baseDrawSeed = (totalSeed * 33) / 100;
+        } else if (pointDiff <= 10) {
+            baseDrawSeed = (totalSeed * 25) / 100;
+        } else {
+            baseDrawSeed = (totalSeed * 20) / 100;  // Big gap → Fewer draws
+        }
+
+        // Distribute remaining seed based on points
+        uint256 remainingSeed = totalSeed - baseDrawSeed;
+        homeSeed = (remainingSeed * adjustedHomePoints) / totalPoints;
+        awaySeed = remainingSeed - homeSeed;
+        drawSeed = baseDrawSeed;
+
+        // Fine-tune based on goal difference
+        if (homeGD > awayGD + 5) {
+            uint256 gdBoost = (homeSeed * 5) / 100;
+            homeSeed += gdBoost;
+            if (awaySeed > gdBoost) awaySeed -= gdBoost;
+        } else if (awayGD > homeGD + 5) {
+            uint256 gdBoost = (awaySeed * 5) / 100;
+            awaySeed += gdBoost;
+            if (homeSeed > gdBoost) homeSeed -= gdBoost;
+        }
+
+        // Check for defensive matchups (more draws)
+        uint256 homeTotalGames = homeTeam.wins + homeTeam.draws + homeTeam.losses;
+        uint256 awayTotalGames = awayTeam.wins + awayTeam.draws + awayTeam.losses;
+
+        if (homeTotalGames > 0 && awayTotalGames > 0) {
+            uint256 homeAvgGoals = (homeTeam.goalsFor + homeTeam.goalsAgainst) / homeTotalGames;
+            uint256 awayAvgGoals = (awayTeam.goalsFor + awayTeam.goalsAgainst) / awayTotalGames;
+
+            if (homeAvgGoals < 2 && awayAvgGoals < 2) {
+                uint256 drawBoost = (drawSeed * 20) / 100;
+                drawSeed += drawBoost;
+                homeSeed -= drawBoost / 2;
+                awaySeed -= drawBoost / 2;
+            }
+        }
+
+        // Ensure minimum seeds
+        if (homeSeed < 50 ether) homeSeed = 50 ether;
+        if (awaySeed < 50 ether) awaySeed = 50 ether;
+        if (drawSeed < 50 ether) drawSeed = 50 ether;
+
+        // Normalize to exactly SEED_PER_MATCH
+        uint256 actualTotal = homeSeed + awaySeed + drawSeed;
+        homeSeed = (homeSeed * totalSeed) / actualTotal;
+        awaySeed = (awaySeed * totalSeed) / actualTotal;
+        drawSeed = totalSeed - homeSeed - awaySeed;
+
+        return (homeSeed, awaySeed, drawSeed);
+    }
+
+    /**
+     * @notice Seed match pools at round start with DYNAMIC differentiated odds
+     * @dev Uses hybrid model: pseudo-random for rounds 1-3, stats-based for rounds 4+
+     * @param roundId The round to seed
+     */
+    function seedRoundPools(uint256 roundId) external onlyOwner {
+        RoundAccounting storage accounting = roundAccounting[roundId];
+        require(!accounting.seeded, "Round already seeded");
+        require(!accounting.settled, "Round already settled");
+
+        // CIRCUIT BREAKER: Ensure protocol reserve can cover seeding + safety buffer
+        uint256 totalSeedAmount = SEED_PER_ROUND; // 3,000 LEAGUE
+        uint256 minRequiredReserve = totalSeedAmount * 3; // 3x seeding cost (9,000 LEAGUE minimum)
+        require(
+            protocolReserve >= minRequiredReserve,
+            "Circuit breaker: Insufficient protocol reserve - replenish before seeding"
+        );
+
+        totalSeedAmount = 0;
+
+        // Seed each match with DIFFERENTIATED amounts based on team matchup
+        for (uint256 matchIndex = 0; matchIndex < 10; matchIndex++) {
+            (uint256 homeSeed, uint256 awaySeed, uint256 drawSeed) = _calculateMatchSeeds(roundId, matchIndex);
+
+            MatchPool storage pool = accounting.matchPools[matchIndex];
+            pool.homeWinPool = homeSeed;
+            pool.awayWinPool = awaySeed;
+            pool.drawPool = drawSeed;
+            pool.totalPool = homeSeed + awaySeed + drawSeed;
+
+            totalSeedAmount += pool.totalPool;
+            accounting.totalBetVolume += pool.totalPool;
+        }
+
+        // Deduct from protocol reserve
+        require(protocolReserve >= totalSeedAmount, "Insufficient reserve");
+        protocolReserve -= totalSeedAmount;
+        accounting.protocolSeedAmount = totalSeedAmount;
+        accounting.seeded = true;
+
+        emit RoundSeeded(roundId, totalSeedAmount);
+    }
+
+    // ============ Betting Functions ============
+
+    /**
+     * @notice Place a bet on multiple match outcomes
+     * @param matchIndices Array of match indices (0-9)
+     * @param outcomes Array of predicted outcomes (1=HOME, 2=AWAY, 3=DRAW)
+     * @param amount Total LEAGUE to bet (protocol bonus added on top)
+     */
+    function placeBet(
+        uint256[] calldata matchIndices,
+        uint8[] calldata outcomes,
+        uint256 amount
+    ) external nonReentrant returns (uint256 betId) {
+        require(amount > 0, "Amount must be > 0");
+        require(amount <= MAX_BET_AMOUNT, "Bet exceeds maximum"); // CRITICAL: Cap max bet
+        require(matchIndices.length == outcomes.length, "Array length mismatch");
+        require(matchIndices.length > 0 && matchIndices.length <= 10, "Invalid bet count");
+
+        uint256 currentRoundId = gameEngine.getCurrentRound();
+        require(currentRoundId > 0, "No active round");
+        require(!gameEngine.isRoundSettled(currentRoundId), "Round already settled");
+
+        // Transfer user's stake
+        require(
+            leagueToken.transferFrom(msg.sender, address(this), amount),
+            "Transfer failed"
+        );
+
+        RoundAccounting storage accounting = roundAccounting[currentRoundId];
+
+        // Calculate multibet stake bonus (added to pools)
+        uint256 stakeBonus = _calculateMultibetBonus(amount, matchIndices.length);
+        require(protocolReserve >= stakeBonus, "Insufficient reserve for stake bonus");
+        protocolReserve -= stakeBonus;
+
+        uint256 totalWithBonus = amount + stakeBonus;
+
+        accounting.totalBetVolume += totalWithBonus;
+
+        // Split bet evenly across matches with pseudo-random remainder handling (ISSUE #6 fix)
+        uint256 perMatch = totalWithBonus / matchIndices.length;
+        uint256 remainder = totalWithBonus % matchIndices.length;
+
+        // Assign betId FIRST (BUG #1 fix)
+        betId = nextBetId++;
+
+        // Determine if this is a parlay (multi-leg bet)
+        bool isParlay = matchIndices.length > 1;
+
+        // Calculate DYNAMIC parlay multiplier for accurate reservation (BUG #2 fix)
+        // This uses the CURRENT parlay count for tier calculation
+        uint256 parlayMultiplier = _getParlayMultiplierDynamicPreview(
+            matchIndices,
+            currentRoundId,
+            matchIndices.length
+        );
+
+        // CRITICAL: Check reserve can cover worst-case parlay bonus BEFORE accepting bet
+        uint256 maxPossiblePayout = totalWithBonus * (2 ** 10); // Worst case: 10 legs, 2x per leg
+        uint256 maxParlayBonus = (maxPossiblePayout * (parlayMultiplier - 1e18)) / 1e18;
+        require(
+            protocolReserve >= maxParlayBonus + (SEED_PER_ROUND * 3),
+            "Insufficient reserve for parlay - try smaller bet or fewer legs"
+        );
+
+        // Reserve bonus and store mapping
+        uint256 reservedBonus = _reserveParlayBonus(totalWithBonus, parlayMultiplier);
+        betParlayReserve[betId] = reservedBonus;
+
+        // INCREMENT parlay count AFTER calculating multiplier (count-based FOMO)
+        // This ensures next bettor sees the tier has moved
+        if (isParlay) {
+            accounting.parlayCount += 1;
+        }
+
+        // Store bet
+        Bet storage bet = bets[betId];
+        bet.bettor = msg.sender;
+        bet.roundId = currentRoundId;
+        bet.amount = amount;
+        bet.bonus = stakeBonus;
+        bet.lockedMultiplier = parlayMultiplier;  // CRITICAL FIX: Lock multiplier at bet placement
+        bet.settled = false;
+        bet.claimed = false;
+
+        // Pseudo-random remainder index (ISSUE #6 fix - prevents MEV exploitation)
+        uint256 remainderIndex = uint256(
+            keccak256(abi.encodePacked(betId, msg.sender, block.timestamp))
+        ) % matchIndices.length;
+
+        // Now add predictions and update pools
+        for (uint256 i = 0; i < matchIndices.length; i++) {
+            uint256 matchIndex = matchIndices[i];
+            uint8 outcome = outcomes[i];
+
+            require(matchIndex < 10, "Invalid match index");
+            require(outcome >= 1 && outcome <= 3, "Invalid outcome");
+
+            // Allocate with remainder distributed pseudo-randomly
+            uint256 allocation = perMatch + (i == remainderIndex ? remainder : 0);
+
+            // Add to appropriate match pool
+            MatchPool storage pool = accounting.matchPools[matchIndex];
+
+            if (outcome == 1) {
+                pool.homeWinPool += allocation;
+            } else if (outcome == 2) {
+                pool.awayWinPool += allocation;
+            } else {
+                pool.drawPool += allocation;
+            }
+            pool.totalPool += allocation;
+
+            // Push prediction to storage array
+            bet.predictions.push(Prediction({
+                matchIndex: matchIndex,
+                predictedOutcome: outcome,
+                amountInPool: allocation
+            }));
+        }
+
+        userBets[msg.sender].push(betId);
+
+        emit BetPlaced(
+            betId,
+            msg.sender,
+            currentRoundId,
+            amount,
+            stakeBonus,
+            parlayMultiplier,
+            matchIndices,
+            outcomes
+        );
+    }
+
+    /**
+     * @notice Claim winnings for a bet (pull pattern)
+     * @param betId The bet ID to claim
+     */
+    function claimWinnings(uint256 betId) external nonReentrant {
+        Bet storage bet = bets[betId];
+        require(bet.bettor == msg.sender, "Not your bet");
+        require(!bet.claimed, "Already claimed");
+
+        RoundAccounting storage accounting = roundAccounting[bet.roundId];
+        require(accounting.settled, "Round not settled");
+
+        // Calculate if bet won and payout amount (with parlay multiplier)
+        (bool won, uint256 basePayout, uint256 finalPayout) = _calculateBetPayout(betId);
+
+        bet.claimed = true;
+
+        if (won && finalPayout > 0) {
+            // CRITICAL: Check per-round payout cap to prevent reserve depletion
+            require(
+                accounting.totalPaidOut + finalPayout <= MAX_ROUND_PAYOUTS,
+                "Round payout limit reached - contact support"
+            );
+
+            accounting.totalClaimed += finalPayout;
+            accounting.totalPaidOut += finalPayout; // Track total paid including bonuses
+
+            // Release locked parlay reserve
+            uint256 reservedBonus = betParlayReserve[betId];
+            uint256 actualBonus = finalPayout - basePayout;
+
+            if (reservedBonus > 0) {
+                if (actualBonus <= reservedBonus) {
+                    // Return unused portion and consume reserved for actual bonus
+                    uint256 unused = reservedBonus - actualBonus;
+                    // Remove full reservation
+                    lockedParlayReserve -= reservedBonus;
+                    // Return unused back to protocol reserve
+                    protocolReserve += unused;
+                } else {
+                    // actual bonus exceeds reserved amount: consume reserved and pull extra from protocol reserve
+                    lockedParlayReserve -= reservedBonus;
+                    uint256 extraNeeded = actualBonus - reservedBonus;
+                    require(protocolReserve >= extraNeeded, "Insufficient protocol reserve for parlay payout");
+                    protocolReserve -= extraNeeded;
+                }
+
+                emit ParlayBonusReleased(betId, reservedBonus, actualBonus);
+            }
+
+            // Transfer winnings
+            require(leagueToken.transfer(msg.sender, finalPayout), "Transfer failed");
+
+            emit WinningsClaimed(
+                betId,
+                msg.sender,
+                basePayout,
+                bet.lockedMultiplier,  // Use locked multiplier instead of recalculating
+                finalPayout
+            );
+        } else {
+            // Bet lost - release ALL reserved parlay bonus
+            uint256 reservedBonus = betParlayReserve[betId];
+            if (reservedBonus > 0) {
+                lockedParlayReserve -= reservedBonus;
+                protocolReserve += reservedBonus;
+                emit ParlayBonusReleased(betId, reservedBonus, 0);
+            }
+
+            emit BetLost(betId, msg.sender);
+        }
+    }
+
+    // ============ Settlement Functions ============
+
+    /**
+     * @notice Settle round after VRF generates results
+     * @param roundId The round to settle
+     */
+    function settleRound(uint256 roundId) external nonReentrant {
+        require(gameEngine.isRoundSettled(roundId), "Round not settled in GameEngine");
+
+        RoundAccounting storage accounting = roundAccounting[roundId];
+        require(!accounting.settled, "Already settled");
+
+        // Calculate winning and losing pools (O(10) - constant time)
+        for (uint256 matchIndex = 0; matchIndex < 10; matchIndex++) {
+            IGameEngine.Match memory matchResult = gameEngine.getMatch(roundId, matchIndex);
+            MatchPool storage pool = accounting.matchPools[matchIndex];
+
+            IGameEngine.MatchOutcome winningOutcome = matchResult.outcome;
+            uint256 winningPool;
+            uint256 losingPool;
+
+            if (winningOutcome == IGameEngine.MatchOutcome.HOME_WIN) {
+                winningPool = pool.homeWinPool;
+                losingPool = pool.awayWinPool + pool.drawPool;
+            } else if (winningOutcome == IGameEngine.MatchOutcome.AWAY_WIN) {
+                winningPool = pool.awayWinPool;
+                losingPool = pool.homeWinPool + pool.drawPool;
+            } else {
+                // DRAW
+                winningPool = pool.drawPool;
+                losingPool = pool.homeWinPool + pool.awayWinPool;
+            }
+
+            accounting.totalWinningPool += winningPool;
+            accounting.totalLosingPool += losingPool;
+        }
+
+        // Calculate total owed to winners (prevents LP exploit)
+        accounting.totalReservedForWinners = _calculateTotalWinningPayouts(roundId);
+
+        accounting.settled = true;
+        accounting.roundEndTime = block.timestamp;
+
+        emit RoundSettled(
+            roundId,
+            accounting.totalWinningPool,
+            accounting.totalLosingPool,
+            accounting.totalReservedForWinners
+        );
+    }
+
+    /**
+     * @notice Distribute net revenue after all claims (or after timeout)
+     * @param roundId The round to finalize
+     */
+    function finalizeRoundRevenue(uint256 roundId) external nonReentrant {
+        RoundAccounting storage accounting = roundAccounting[roundId];
+        require(accounting.settled, "Round not settled");
+        require(!accounting.revenueDistributed, "Already distributed");
+
+        // Net revenue = losing pool - reserved for winners
+        // (Protocol seed is treated as a bet and participates in the market)
+        uint256 netRevenue = accounting.totalLosingPool > accounting.totalReservedForWinners
+            ? accounting.totalLosingPool - accounting.totalReservedForWinners
+            : 0;
+
+        // Split revenue: 45% protocol + 53% LP + 2% season (Logic2.md economic model)
+        uint256 protocolShare = (netRevenue * PROTOCOL_CUT) / 10000;
+        uint256 seasonShare = (netRevenue * SEASON_POOL_SHARE) / 10000;
+        uint256 lpShare = netRevenue - protocolShare - seasonShare;
+
+        // Track revenue shares
+        accounting.protocolRevenueShare = protocolShare;
+        accounting.lpRevenueShare = lpShare;
+        accounting.seasonRevenueShare = seasonShare;
+        accounting.revenueDistributed = true;
+
+        // Distribute
+        if (protocolShare > 0) {
+            require(leagueToken.transfer(protocolTreasury, protocolShare), "Protocol transfer failed");
+        }
+
+        if (lpShare > 0) {
+            require(leagueToken.approve(address(liquidityPool), lpShare), "LP approval failed");
+            liquidityPool.addLiquidity(lpShare);
+        }
+
+        if (seasonShare > 0) {
+            seasonRewardPool += seasonShare;
+        }
+
+        emit RoundRevenueFinalized(
+            roundId,
+            netRevenue,
+            protocolShare,
+            lpShare,
+            seasonShare,
+            accounting.protocolSeedAmount
+        );
+    }
+
+    // ============ Internal Helper Functions ============
+
+    /**
+     * @notice Calculate multibet stake bonus (added to pools upfront)
+     */
+    function _calculateMultibetBonus(uint256 amount, uint256 numMatches)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (numMatches == 1) return 0;
+        if (numMatches == 2) return (amount * BONUS_2_MATCH) / 10000;
+        if (numMatches == 3) return (amount * BONUS_3_MATCH) / 10000;
+        return (amount * BONUS_4_PLUS) / 10000; // 4+ matches
+    }
+
+    /**
+     * @notice Get parlay payout multiplier based on number of legs
+     * @dev Multipliers are capped to prevent exponential growth
+     * @param numLegs Number of matches in multibet
+     * @return multiplier Multiplier in 1e18 scale (e.g., 1.5e18 = 1.5x)
+     */
+    /**
+     * @notice Get base parlay multiplier based on number of matches (UPDATED: linear 1.15x-1.5x)
+     * @dev Linear progression: 1 match = 1.0x, 2 matches = 1.15x, 10 matches = 1.5x
+     * @param numMatches Number of matches in the parlay
+     * @return multiplier Multiplier in 1e18 scale
+     */
+    function _getParlayMultiplier(uint256 numMatches)
+        internal
+        pure
+        returns (uint256 multiplier)
+    {
+        if (numMatches == 1) return PARLAY_MULTIPLIER_1_MATCH;      // 1.0x
+        if (numMatches == 2) return PARLAY_MULTIPLIER_2_MATCHES;    // 1.15x
+        if (numMatches == 3) return PARLAY_MULTIPLIER_3_MATCHES;    // 1.194x
+        if (numMatches == 4) return PARLAY_MULTIPLIER_4_MATCHES;    // 1.238x
+        if (numMatches == 5) return PARLAY_MULTIPLIER_5_MATCHES;    // 1.281x
+        if (numMatches == 6) return PARLAY_MULTIPLIER_6_MATCHES;    // 1.325x
+        if (numMatches == 7) return PARLAY_MULTIPLIER_7_MATCHES;    // 1.369x
+        if (numMatches == 8) return PARLAY_MULTIPLIER_8_MATCHES;    // 1.413x
+        if (numMatches == 9) return PARLAY_MULTIPLIER_9_MATCHES;    // 1.456x
+        return PARLAY_MULTIPLIER_10_MATCHES;                         // 1.5x (capped at 10)
+    }
+
+    /**
+     * @notice Calculate pool imbalance for a match (Logic2.md)
+     * @dev Measures dominance of largest pool
+     * @param roundId The round ID
+     * @param matchIndex The match index (0-9)
+     * @return imbalance Pool imbalance in basis points (0-10000, where 10000 = 100%)
+     */
+    function _calculatePoolImbalance(uint256 roundId, uint256 matchIndex)
+        internal
+        view
+        returns (uint256 imbalance)
+    {
+        MatchPool storage pool = roundAccounting[roundId].matchPools[matchIndex];
+
+        if (pool.totalPool == 0) return 0;
+
+        // Find max pool
+        uint256 maxPool = pool.homeWinPool;
+        if (pool.awayWinPool > maxPool) maxPool = pool.awayWinPool;
+        if (pool.drawPool > maxPool) maxPool = pool.drawPool;
+
+        // Return as basis points (10000 = 100%)
+        imbalance = (maxPool * 10000) / pool.totalPool;
+
+        return imbalance;
+    }
+
+    /**
+     * @notice Get count-based parlay multiplier (PRIMARY FOMO mechanism)
+     * @dev Returns multiplier based on parlay index in current round
+     * @param parlayIndex The current parlay count (0-indexed)
+     * @return multiplier Multiplier in 1e18 scale
+     */
+    function _getParlayMultiplierByCount(uint256 parlayIndex)
+        internal
+        pure
+        returns (uint256 multiplier)
+    {
+        if (parlayIndex < COUNT_TIER_1) return COUNT_MULT_TIER_1;      // 2.5x (first 10)
+        if (parlayIndex < COUNT_TIER_2) return COUNT_MULT_TIER_2;      // 2.2x (next 10)
+        if (parlayIndex < COUNT_TIER_3) return COUNT_MULT_TIER_3;      // 1.9x (next 10)
+        if (parlayIndex < COUNT_TIER_4) return COUNT_MULT_TIER_4;      // 1.6x (next 10)
+        return COUNT_MULT_TIER_5;                                        // 1.3x (41+)
+    }
+
+    /**
+     * @notice Get reserve-based decay factor (SECONDARY safety valve)
+     * @dev Higher locked reserve = lower multipliers (capital protection)
+     * @return decayFactor Percentage to apply to multiplier (10000 = 100%)
+     */
+    function _getReserveDecayFactor() internal view returns (uint256 decayFactor) {
+        uint256 locked = lockedParlayReserve;
+
+        if (locked < RESERVE_TIER_1) {
+            return TIER_1_DECAY; // 100% (no decay)
+        } else if (locked < RESERVE_TIER_2) {
+            return TIER_2_DECAY; // 88% (12% decay)
+        } else if (locked < RESERVE_TIER_3) {
+            return TIER_3_DECAY; // 76% (24% decay)
+        } else {
+            return TIER_4_DECAY; // 64% (36% decay)
+        }
+    }
+
+    /**
+     * @notice Get liquidity-aware parlay multiplier (PREVIEW for reservation)
+     * @dev Combines 3 layers: count-based tiers + reserve decay + pool imbalance
+     * @dev Used BEFORE bet exists for accurate reservation
+     * @param matchIndices Array of match indices
+     * @param roundId The round ID
+     * @param numLegs Number of legs
+     * @return multiplier Multiplier in 1e18 scale
+     */
+    function _getParlayMultiplierDynamicPreview(
+        uint256[] calldata matchIndices,
+        uint256 roundId,
+        uint256 numLegs
+    )
+        internal
+        view
+        returns (uint256 multiplier)
+    {
+        // Single bets always get 1.0x
+        if (numLegs == 1) return 1e18;
+
+        RoundAccounting storage accounting = roundAccounting[roundId];
+
+        // LAYER 1: Base multiplier based on number of matches (NEW: Linear 1.15x-1.5x)
+        uint256 countBasedMult = _getParlayMultiplier(numLegs);
+
+        // LAYER 2: Pool imbalance gating (ECONOMIC PROTECTION)
+        uint256 totalImbalance = 0;
+        for (uint256 i = 0; i < matchIndices.length; i++) {
+            uint256 imbalance = _calculatePoolImbalance(roundId, matchIndices[i]);
+            totalImbalance += imbalance;
+        }
+        uint256 avgImbalance = totalImbalance / matchIndices.length;
+
+        // If pools are balanced, reduce to minimum regardless of tier
+        if (avgImbalance < MIN_IMBALANCE_FOR_FULL_BONUS) {
+            return MIN_PARLAY_MULTIPLIER; // 1.1x
+        }
+
+        // LAYER 3: Reserve-based decay (SECONDARY SAFETY VALVE)
+        uint256 decayFactor = _getReserveDecayFactor();
+        uint256 finalMultiplier = (countBasedMult * decayFactor) / 10000;
+
+        // Never go below minimum
+        if (finalMultiplier < MIN_PARLAY_MULTIPLIER) {
+            return MIN_PARLAY_MULTIPLIER;
+        }
+
+        return finalMultiplier;
+    }
+
+    /**
+     * @notice Get liquidity-aware parlay multiplier (stored from bet placement)
+     * @dev Uses the same layered model as preview for consistency
+     * @dev This is called during payout - multiplier was locked at bet time
+     * @param betId The bet ID
+     * @return multiplier Multiplier in 1e18 scale
+     */
+    function _getParlayMultiplierDynamic(uint256 betId)
+        internal
+        view
+        returns (uint256 multiplier)
+    {
+        Bet storage bet = bets[betId];
+        uint256 numLegs = bet.predictions.length;
+
+        // Single bets always get 1.0x
+        if (numLegs == 1) return 1e18;
+
+        // NOTE: This recalculates the multiplier at payout time
+        // In production, you might want to store the locked multiplier in the Bet struct
+        // For now, we recalculate using the SAME logic as preview to ensure consistency
+
+        RoundAccounting storage accounting = roundAccounting[bet.roundId];
+
+        // We use the parlay count AT THE TIME OF BET PLACEMENT
+        // This is stored implicitly - the bet was placed when count was X
+        // For simplicity, we recalculate based on imbalance + reserve state
+
+        // Calculate average imbalance across all legs
+        uint256 totalImbalance = 0;
+        for (uint256 i = 0; i < bet.predictions.length; i++) {
+            Prediction memory pred = bet.predictions[i];
+            uint256 imbalance = _calculatePoolImbalance(bet.roundId, pred.matchIndex);
+            totalImbalance += imbalance;
+        }
+        uint256 avgImbalance = totalImbalance / bet.predictions.length;
+
+        // If pools were balanced at bet time, reduce to minimum
+        if (avgImbalance < MIN_IMBALANCE_FOR_FULL_BONUS) {
+            return MIN_PARLAY_MULTIPLIER; // 1.1x
+        }
+
+        // For payout, we use the reserved multiplier
+        // This should match what was calculated at bet placement
+        // NOTE: In V2.2, consider storing multiplier in Bet struct for exact consistency
+
+        // Use the base multiplier from number of legs as fallback
+        uint256 baseMultiplier = _getParlayMultiplier(numLegs);
+        return baseMultiplier > MIN_PARLAY_MULTIPLIER ? baseMultiplier : MIN_PARLAY_MULTIPLIER;
+    }
+
+    /**
+     * @notice Reserve parlay bonus at bet time to prevent insolvency
+     * @dev Reserves max possible bonus (pessimistic estimate)
+     * @return maxBonus The amount reserved from protocol reserve
+     */
+    function _reserveParlayBonus(uint256 totalStake, uint256 parlayMultiplier)
+        internal
+        returns (uint256 maxBonus)
+    {
+        if (parlayMultiplier == 1e18) return 0; // No bonus for single bets
+
+        // Pessimistic estimate: assume 10x base payout (very high odds)
+        uint256 maxBasePayout = totalStake * 10;
+
+        // Calculate max bonus needed
+        maxBonus = (maxBasePayout * (parlayMultiplier - 1e18)) / 1e18;
+
+        require(protocolReserve >= maxBonus, "Insufficient reserve for parlay bonus");
+
+        // Lock the bonus (caller will store betId mapping)
+        lockedParlayReserve += maxBonus;
+        protocolReserve -= maxBonus;
+
+        return maxBonus;
+    }
+
+    /**
+     * @notice Calculate bet payout with parlay multiplier
+     * @return won Whether all predictions were correct
+     * @return basePayout Base payout from pools (without multiplier)
+     * @return finalPayout Final payout after parlay multiplier
+     */
+    function _calculateBetPayout(uint256 betId)
+        internal
+        view
+        returns (bool won, uint256 basePayout, uint256 finalPayout)
+    {
+        Bet storage bet = bets[betId];
+        RoundAccounting storage accounting = roundAccounting[bet.roundId];
+
+        bool allCorrect = true;
+        uint256 totalBasePayout = 0;
+
+        for (uint256 i = 0; i < bet.predictions.length; i++) {
+            Prediction memory pred = bet.predictions[i];
+            IGameEngine.Match memory matchResult = gameEngine.getMatch(
+                bet.roundId,
+                pred.matchIndex
+            );
+
+            // Check if prediction is correct
+            IGameEngine.MatchOutcome predictedEnum;
+            if (pred.predictedOutcome == 1) predictedEnum = IGameEngine.MatchOutcome.HOME_WIN;
+            else if (pred.predictedOutcome == 2) predictedEnum = IGameEngine.MatchOutcome.AWAY_WIN;
+            else predictedEnum = IGameEngine.MatchOutcome.DRAW;
+
+            if (matchResult.outcome != predictedEnum) {
+                allCorrect = false;
+                break; // Multibet failed
+            }
+
+            // Calculate payout for this match using pool ratios
+            MatchPool storage pool = accounting.matchPools[pred.matchIndex];
+            uint256 winningPool = _getWinningPoolAmount(pool, pred.predictedOutcome);
+            uint256 losingPool = pool.totalPool - winningPool;
+
+            if (winningPool == 0) {
+                totalBasePayout += pred.amountInPool;
+                continue;
+            }
+
+            // Calculate share of losing pool (55% goes to winners, 45% to protocol)
+            uint256 distributedLosingPool = (losingPool * WINNER_SHARE) / 10000;
+
+            // User's share is proportional to their bet in the winning pool
+            uint256 multiplier = 1e18 + (distributedLosingPool * 1e18) / winningPool;
+            uint256 matchPayout = (pred.amountInPool * multiplier) / 1e18;
+
+            totalBasePayout += matchPayout;
+        }
+
+        if (!allCorrect) {
+            return (false, 0, 0);
+        }
+
+        // Apply LOCKED parlay multiplier (CRITICAL FIX: use stored value from bet placement)
+        uint256 parlayMultiplier = bet.lockedMultiplier;
+        uint256 totalFinalPayout = (totalBasePayout * parlayMultiplier) / 1e18;
+
+        // CRITICAL: Cap maximum payout per bet to protect protocol reserve
+        if (totalFinalPayout > MAX_PAYOUT_PER_BET) {
+            totalFinalPayout = MAX_PAYOUT_PER_BET;
+        }
+
+        return (true, totalBasePayout, totalFinalPayout);
+    }
+
+    /**
+     * @notice Calculate total payouts owed to ALL winners
+     * @dev Loops through 10 matches (O(10) constant time)
+     * @dev NOTE: This calculates BASE payouts only (without parlay multipliers)
+     * @dev Parlay bonuses are tracked separately in lockedParlayReserve
+     */
+    function _calculateTotalWinningPayouts(uint256 roundId)
+        internal
+        view
+        returns (uint256 totalOwed)
+    {
+        RoundAccounting storage accounting = roundAccounting[roundId];
+
+        for (uint256 matchIndex = 0; matchIndex < 10; matchIndex++) {
+            IGameEngine.Match memory matchResult = gameEngine.getMatch(roundId, matchIndex);
+            MatchPool storage pool = accounting.matchPools[matchIndex];
+
+            IGameEngine.MatchOutcome winningOutcome = matchResult.outcome;
+            if (winningOutcome == IGameEngine.MatchOutcome.PENDING) continue;
+
+            uint8 outcomeAsUint8;
+            if (winningOutcome == IGameEngine.MatchOutcome.HOME_WIN) outcomeAsUint8 = 1;
+            else if (winningOutcome == IGameEngine.MatchOutcome.AWAY_WIN) outcomeAsUint8 = 2;
+            else outcomeAsUint8 = 3; // DRAW
+
+            uint256 winningPool = _getWinningPoolAmount(pool, outcomeAsUint8);
+            uint256 losingPool = pool.totalPool - winningPool;
+
+            if (winningPool == 0) continue;
+
+            // Calculate total to be distributed (55% of losing pool, 45% to protocol)
+            uint256 distributedLosingPool = (losingPool * WINNER_SHARE) / 10000;
+
+            // Total owed = original winning pool + their share of losing pool
+            uint256 totalOwedForMatch = winningPool + distributedLosingPool;
+            totalOwed += totalOwedForMatch;
+        }
+
+        return totalOwed;
+    }
+
+    /**
+     * @notice Get the winning pool amount for a given outcome
+     */
+    function _getWinningPoolAmount(MatchPool storage pool, uint8 outcome)
+        internal
+        view
+        returns (uint256)
+    {
+        if (outcome == 1) return pool.homeWinPool;
+        if (outcome == 2) return pool.awayWinPool;
+        return pool.drawPool;
+    }
+
+    // ============ Admin Functions ============
+
+    /**
+     * @notice Fund protocol reserve (required for bonuses and seeding)
+     * @param amount Amount of LEAGUE to add
+     */
+    function fundProtocolReserve(uint256 amount) external {
+        require(amount > 0, "Amount must be > 0");
+        require(
+            leagueToken.transferFrom(msg.sender, address(this), amount),
+            "Transfer failed"
+        );
+
+        protocolReserve += amount;
+
+        emit ProtocolReserveFunded(msg.sender, amount);
+    }
+
+    /**
+     * @notice Update protocol treasury address
+     */
+    function setProtocolTreasury(address _treasury) external onlyOwner {
+        require(_treasury != address(0), "Invalid address");
+        protocolTreasury = _treasury;
+    }
+
+    /**
+     * @notice Update rewards distributor address
+     */
+    function setRewardsDistributor(address _distributor) external onlyOwner {
+        require(_distributor != address(0), "Invalid address");
+        rewardsDistributor = _distributor;
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get preview of match odds before any bets (for frontend)
+     * @dev Shows initial seeded odds for a match based on team matchup
+     * @param roundId The round ID
+     * @param matchIndex The match index (0-9)
+     * @return homeOdds Home win odds (e.g., 1.2e18 = 1.2x)
+     * @return awayOdds Away win odds
+     * @return drawOdds Draw odds
+     */
+    function previewMatchOdds(uint256 roundId, uint256 matchIndex)
+        external
+        view
+        returns (
+            uint256 homeOdds,
+            uint256 awayOdds,
+            uint256 drawOdds
+        )
+    {
+        RoundAccounting storage accounting = roundAccounting[roundId];
+        MatchPool storage pool = accounting.matchPools[matchIndex];
+
+        // Use CURRENT pool state (includes all bets placed so far)
+        uint256 homePool = pool.homeWinPool;
+        uint256 awayPool = pool.awayWinPool;
+        uint256 drawPool = pool.drawPool;
+        uint256 totalPool = pool.totalPool;
+
+        // If not seeded yet, calculate what the initial odds would be
+        if (totalPool == 0) {
+            (homePool, awayPool, drawPool) = _calculateMatchSeeds(roundId, matchIndex);
+            totalPool = homePool + awayPool + drawPool;
+        }
+
+        // Apply virtual liquidity to dampen price impact
+        uint256 virtualLiquidity = SEED_PER_MATCH * VIRTUAL_LIQUIDITY_MULTIPLIER; // 3000 LEAGUE virtual
+
+        // Add virtual liquidity to each pool
+        uint256 virtualHomePool = homePool + (virtualLiquidity / 3);
+        uint256 virtualAwayPool = awayPool + (virtualLiquidity / 3);
+        uint256 virtualDrawPool = drawPool + (virtualLiquidity / 3);
+        uint256 virtualTotalPool = virtualHomePool + virtualAwayPool + virtualDrawPool;
+
+        // Calculate dampened market odds
+        homeOdds = (virtualTotalPool * 1e18) / virtualHomePool;
+        awayOdds = (virtualTotalPool * 1e18) / virtualAwayPool;
+        drawOdds = (virtualTotalPool * 1e18) / virtualDrawPool;
+
+        return (homeOdds, awayOdds, drawOdds);
+    }
+
+    /**
+     * @notice Get odds for all 10 matches in a round
+     * @param roundId The round ID
+     * @return homeOdds Array of home win odds (1e18 scale)
+     * @return awayOdds Array of away win odds (1e18 scale)
+     * @return drawOdds Array of draw odds (1e18 scale)
+     */
+    function getAllMatchOdds(uint256 roundId)
+        external
+        view
+        returns (
+            uint256[10] memory homeOdds,
+            uint256[10] memory awayOdds,
+            uint256[10] memory drawOdds
+        )
+    {
+        RoundAccounting storage accounting = roundAccounting[roundId];
+
+        for (uint256 i = 0; i < 10; i++) {
+            MatchPool storage pool = accounting.matchPools[i];
+
+            uint256 homePool = pool.homeWinPool;
+            uint256 awayPool = pool.awayWinPool;
+            uint256 drawPool = pool.drawPool;
+            uint256 totalPool = pool.totalPool;
+
+            // If not seeded yet, calculate initial odds
+            if (totalPool == 0) {
+                (homePool, awayPool, drawPool) = _calculateMatchSeeds(roundId, i);
+                totalPool = homePool + awayPool + drawPool;
+            }
+
+            // Apply virtual liquidity to dampen price impact
+            uint256 virtualLiquidity = SEED_PER_MATCH * VIRTUAL_LIQUIDITY_MULTIPLIER; // 3000 LEAGUE
+
+            // Add virtual liquidity to each pool
+            uint256 virtualHomePool = homePool + (virtualLiquidity / 3);
+            uint256 virtualAwayPool = awayPool + (virtualLiquidity / 3);
+            uint256 virtualDrawPool = drawPool + (virtualLiquidity / 3);
+            uint256 virtualTotalPool = virtualHomePool + virtualAwayPool + virtualDrawPool;
+
+            // Calculate dampened odds
+            homeOdds[i] = (virtualTotalPool * 1e18) / virtualHomePool;
+            awayOdds[i] = (virtualTotalPool * 1e18) / virtualAwayPool;
+            drawOdds[i] = (virtualTotalPool * 1e18) / virtualDrawPool;
+        }
+    }
+
+    /**
+     * @notice Get current parlay multiplier for a bet (preview before placing)
+     * @dev Shows users what multiplier they'll get with FOMO tier visibility
+     * @param roundId The round ID
+     * @param matchIndices Array of match indices
+     * @param numLegs Number of legs in the parlay
+     * @return currentMultiplier The multiplier they would get now (1e18 scale)
+     * @return currentTier Current count-based tier (1-5)
+     * @return parlaysLeftInTier How many parlays left in current tier
+     * @return nextTierMultiplier What multiplier drops to in next tier
+     */
+    function getCurrentParlayMultiplier(
+        uint256 roundId,
+        uint256[] calldata matchIndices,
+        uint256 numLegs
+    )
+        external
+        view
+        returns (
+            uint256 currentMultiplier,
+            uint256 currentTier,
+            uint256 parlaysLeftInTier,
+            uint256 nextTierMultiplier
+        )
+    {
+        if (numLegs == 1) {
+            return (1e18, 0, 0, 0); // Single bets don't use tiers
+        }
+
+        RoundAccounting storage accounting = roundAccounting[roundId];
+        uint256 parlayCount = accounting.parlayCount;
+
+        // Determine current tier
+        if (parlayCount < COUNT_TIER_1) {
+            currentTier = 1;
+            parlaysLeftInTier = COUNT_TIER_1 - parlayCount;
+            nextTierMultiplier = COUNT_MULT_TIER_2;
+        } else if (parlayCount < COUNT_TIER_2) {
+            currentTier = 2;
+            parlaysLeftInTier = COUNT_TIER_2 - parlayCount;
+            nextTierMultiplier = COUNT_MULT_TIER_3;
+        } else if (parlayCount < COUNT_TIER_3) {
+            currentTier = 3;
+            parlaysLeftInTier = COUNT_TIER_3 - parlayCount;
+            nextTierMultiplier = COUNT_MULT_TIER_4;
+        } else if (parlayCount < COUNT_TIER_4) {
+            currentTier = 4;
+            parlaysLeftInTier = COUNT_TIER_4 - parlayCount;
+            nextTierMultiplier = COUNT_MULT_TIER_5;
+        } else {
+            currentTier = 5;
+            parlaysLeftInTier = 0; // Final tier
+            nextTierMultiplier = COUNT_MULT_TIER_5;
+        }
+
+        // Calculate actual multiplier using layered model
+        currentMultiplier = _getParlayMultiplierDynamicPreview(
+            matchIndices,
+            roundId,
+            numLegs
+        );
+
+        return (currentMultiplier, currentTier, parlaysLeftInTier, nextTierMultiplier);
+    }
+
+    function getMatchPoolData(uint256 roundId, uint256 matchIndex)
+        external
+        view
+        returns (
+            uint256 homePool,
+            uint256 awayPool,
+            uint256 drawPool,
+            uint256 totalPool
+        )
+    {
+        MatchPool storage pool = roundAccounting[roundId].matchPools[matchIndex];
+        return (pool.homeWinPool, pool.awayWinPool, pool.drawPool, pool.totalPool);
+    }
+
+    function getBet(uint256 betId)
+        external
+        view
+        returns (
+            address bettor,
+            uint256 roundId,
+            uint256 amount,
+            uint256 bonus,
+            uint256 lockedMultiplier,
+            bool settled,
+            bool claimed
+        )
+    {
+        Bet storage bet = bets[betId];
+        return (
+            bet.bettor,
+            bet.roundId,
+            bet.amount,
+            bet.bonus,
+            bet.lockedMultiplier,
+            bet.settled,
+            bet.claimed
+        );
+    }
+
+    function getUserBets(address user) external view returns (uint256[] memory) {
+        return userBets[user];
+    }
+
+    function getBetPredictions(uint256 betId) external view returns (Prediction[] memory) {
+        return bets[betId].predictions;
+    }
+
+    /**
+     * @notice Get round accounting data including parlay count
+     * @param roundId The round ID
+     * @return totalBetVolume Total amount bet in the round (including bonuses)
+     * @return totalReservedForWinners Total amount reserved for winners
+     * @return protocolRevenueShare Protocol's revenue share
+     * @return seasonRevenueShare Season pool's revenue share
+     * @return parlayCount Number of parlays placed in the round
+     */
+    function getRoundAccounting(uint256 roundId)
+        external
+        view
+        returns (
+            uint256 totalBetVolume,
+            uint256 totalReservedForWinners,
+            uint256 protocolRevenueShare,
+            uint256 seasonRevenueShare,
+            uint256 parlayCount
+        )
+    {
+        RoundAccounting storage accounting = roundAccounting[roundId];
+        return (
+            accounting.totalBetVolume,
+            accounting.totalReservedForWinners,
+            accounting.protocolRevenueShare,
+            accounting.seasonRevenueShare,
+            accounting.parlayCount
+        );
+    }
+
+    /**
+     * @notice Calculate current market odds for a match outcome
+     * @param roundId The round ID
+     * @param matchIndex The match index (0-9)
+     * @param outcome The outcome (1=HOME, 2=AWAY, 3=DRAW)
+     * @return odds The current market odds in 1e18 scale (e.g., 2.5e18 = 2.5x)
+     */
+    function getMarketOdds(uint256 roundId, uint256 matchIndex, uint8 outcome)
+        external
+        view
+        returns (uint256 odds)
+    {
+        MatchPool storage pool = roundAccounting[roundId].matchPools[matchIndex];
+
+        uint256 winningPool = _getWinningPoolAmount(pool, outcome);
+        uint256 losingPool = pool.totalPool - winningPool;
+
+        if (winningPool == 0) return 3e18; // Fallback: fair VRF odds (33.33% = 3.0x)
+
+        // Apply virtual liquidity to dampen price impact
+        // This makes pools behave like they have VIRTUAL_LIQUIDITY_MULTIPLIER times more depth
+        uint256 virtualLiquidity = SEED_PER_MATCH * VIRTUAL_LIQUIDITY_MULTIPLIER; // 3000 LEAGUE virtual
+
+        // Add virtual liquidity proportionally (33.33% per outcome for balanced distribution)
+        uint256 virtualWinningPool = winningPool + (virtualLiquidity / 3);
+        uint256 virtualLosingPool = losingPool + (virtualLiquidity * 2 / 3);
+
+        // Calculate odds with dampened pools
+        uint256 distributedLosingPool = (virtualLosingPool * WINNER_SHARE) / 10000;
+        odds = 1e18 + (distributedLosingPool * 1e18) / virtualWinningPool;
+
+        return odds;
+    }
+
+    /**
+     * @notice Preview bet payout (including parlay multiplier)
+     * @dev Uses locked multiplier from bet placement for accurate preview
+     */
+    function previewBetPayout(uint256 betId)
+        external
+        view
+        returns (bool won, uint256 basePayout, uint256 finalPayout, uint256 parlayMultiplier)
+    {
+        (won, basePayout, finalPayout) = _calculateBetPayout(betId);
+        parlayMultiplier = bets[betId].lockedMultiplier;  // Use locked multiplier
+        return (won, basePayout, finalPayout, parlayMultiplier);
+    }
+}
