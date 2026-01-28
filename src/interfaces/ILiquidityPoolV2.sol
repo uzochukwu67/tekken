@@ -25,6 +25,7 @@ interface ILiquidityPoolV2 {
 
     function totalLiquidity() external view returns (uint256);
     function lockedLiquidity() external view returns (uint256);
+    function roundActive() external view returns (bool);
     function getLPValue(address lp) external view returns (uint256 shareAmount, uint256 sharePercentage);
     function getAvailableLiquidity() external view returns (uint256);
     function canCoverPayout(uint256 amount) external view returns (bool);
