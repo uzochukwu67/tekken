@@ -3,7 +3,8 @@
     "allow": [
       "Bash(npm install:*)",
       "Bash(forge test:*)",
-      "Bash(forge build:*)"
+      "Bash(forge build:*)",
+      "Bash(ls:*)"
     ]
   }
 }

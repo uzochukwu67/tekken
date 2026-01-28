@@ -1,7 +1,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const contracts = ['GameEngine', 'BettingPool', 'LiquidityPool', 'LeagueToken'];
+const contracts = [ 'BettingPoolV2_1', 'LiquidityPoolV2', 'LeagueToken', "SeasonPredictorV2"];
 
 contracts.forEach(name => {
   const jsonPath = path.join(__dirname, `out/${name}.sol/${name}.json`);

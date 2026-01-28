@@ -16,10 +16,7 @@ interface IGameEngine {
         uint8 awayScore;
         MatchOutcome outcome;
         bool settled;
-        // Initial odds based on team stats (scaled by 100, e.g., 150 = 1.5x)
-        uint256 homeOdds;
-        uint256 awayOdds;
-        uint256 drawOdds;
+        // Odds removed - managed by BettingPool
     }
 
     struct Team {

@@ -16,8 +16,10 @@ interface ILiquidityPoolV2 {
     function collectLosingBet(uint256 amount) external;
     function payWinner(address winner, uint256 amount) external;
     function fundSeeding(uint256 roundId, uint256 amount) external returns (bool);
+    function returnSeedFunds(uint256 amount) external;
     function lockLiquidity(uint256 amount) external;
     function unlockLiquidity(uint256 amount) external;
+    function setRoundActive(bool active) external;
 
     // ============ View Functions ============
 

@@ -6,6 +6,13 @@ import {VRFConsumerBaseV2Plus} from "@chainlink/contracts/src/v0.8/vrf/dev/VRFCo
 import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/VRFV2PlusClient.sol";
 
 /**
+ * @notice Interface for BettingPool auto-seeding
+ */
+interface IBettingPoolSeeding {
+    function seedRoundPools(uint256 roundId) external;
+}
+
+/**
  * @title GameEngine
  * @notice Manages match generation, VRF randomness, and season lifecycle
  * @dev 20 teams, 10 matches per round, 36 rounds per season
@@ -14,10 +21,13 @@ import {VRFV2PlusClient} from "@chainlink/contracts/src/v0.8/vrf/dev/libraries/V
 contract GameEngine is VRFConsumerBaseV2Plus {
     LinkTokenInterface public immutable linkToken;
 
+    // Betting Pool reference for auto-seeding
+    address public bettingPool;
+
     // VRF configuration
     uint256 public s_subscriptionId;
     bytes32 public keyHash = 0x787d74caea10b2b357790d5b5247c2f63d1d91572a9846f780606e4d953677ae; // Sepolia gas lane
-    uint32 public callbackGasLimit = 500000;
+    uint32 public callbackGasLimit = 2000000;
     uint16 public requestConfirmations = 3;
     uint32 public numWords = uint32(MATCHES_PER_ROUND); // 1 random word per match; derive two scores per match
 
@@ -25,7 +35,7 @@ contract GameEngine is VRFConsumerBaseV2Plus {
     uint256 public constant TEAMS_COUNT = 20;
     uint256 public constant MATCHES_PER_ROUND = 10;
     uint256 public constant ROUNDS_PER_SEASON = 36;
-    uint256 public constant ROUND_DURATION = 15 minutes;
+    uint256 public constant ROUND_DURATION = 3 hours; // Changed from 15 minutes to 3 hours
 
     enum MatchOutcome {
         PENDING,
@@ -41,10 +51,7 @@ contract GameEngine is VRFConsumerBaseV2Plus {
         uint8 awayScore;
         MatchOutcome outcome;
         bool settled;
-        // Initial odds based on team stats (scaled by 100, e.g., 150 = 1.5x)
-        uint256 homeOdds;
-        uint256 awayOdds;
-        uint256 drawOdds;
+        // Odds removed - betting odds are managed by BettingPool
     }
 
     struct Team {
@@ -81,13 +88,6 @@ contract GameEngine is VRFConsumerBaseV2Plus {
         uint256 roundId;
     }
 
-    struct TestVRFRequest {
-        bool exists;
-        bool fulfilled;
-        uint256 requestTime;
-        uint256[] randomWords;
-    }
-
     // State
     uint256 public currentSeasonId;
     uint256 public currentRoundId;
@@ -101,10 +101,6 @@ contract GameEngine is VRFConsumerBaseV2Plus {
     mapping(uint256 => Team) public teams;
     mapping(uint256 => mapping(uint256 => Team)) public seasonStandings; // seasonId => teamId => Team stats
     mapping(uint256 => RequestStatus) public vrfRequests; // VRF requestId => RequestStatus
-
-    // VRF Testing
-    mapping(uint256 => TestVRFRequest) public testVRFRequests; // requestId => TestVRFRequest
-    uint256 public lastTestRequestId;
 
     // Events
     event SeasonStarted(uint256 indexed seasonId, uint256 startTime);
@@ -122,8 +118,6 @@ contract GameEngine is VRFConsumerBaseV2Plus {
     );
     event VRFRequested(uint256 indexed roundId, uint256 requestId, uint256 paid);
     event VRFFulfilled(uint256 indexed requestId, uint256 indexed roundId);
-    event TestVRFRequested(uint256 indexed requestId, uint256 timestamp);
-    event TestVRFFulfilled(uint256 indexed requestId, uint256[] randomWords);
 
     /**
      * @notice Constructor
@@ -232,27 +226,28 @@ contract GameEngine is VRFConsumerBaseV2Plus {
             uint256 homeId = shuffledTeams[i * 2];
             uint256 awayId = shuffledTeams[i * 2 + 1];
 
-            // Calculate initial odds based on team stats
-            (uint256 homeOdds, uint256 awayOdds, uint256 drawOdds) = _calculateInitialOdds(
-                currentSeasonId,
-                homeId,
-                awayId
-            );
-
+            // Odds are now managed by BettingPool, not GameEngine
             newRound.matches[i] = Match({
                 homeTeamId: homeId,
                 awayTeamId: awayId,
                 homeScore: 0,
                 awayScore: 0,
                 outcome: MatchOutcome.PENDING,
-                settled: false,
-                homeOdds: homeOdds,
-                awayOdds: awayOdds,
-                drawOdds: drawOdds
+                settled: false
             });
         }
 
         emit RoundStarted(currentRoundId, currentSeasonId, block.timestamp);
+
+        // AUTO-SEED: Automatically seed betting pools if BettingPool is configured
+        if (bettingPool != address(0)) {
+            try IBettingPoolSeeding(bettingPool).seedRoundPools(currentRoundId) {
+                // Seeding successful
+            } catch {
+                // Seeding failed - admin can seed manually later if needed
+                // Don't revert to allow round to continue
+            }
+        }
     }
 
     /**
@@ -297,72 +292,13 @@ contract GameEngine is VRFConsumerBaseV2Plus {
     }
 
     /**
-     * @notice Request random sample to test VRF (for testing purposes)
-     * @param enableNativePayment Set to true to pay in native ETH, false for LINK
-     * @param wordsToRequest Number of random words to request (1-10)
-     * @return requestId The VRF request ID
-     */
-    function requestRandomSample(bool enableNativePayment, uint32 wordsToRequest)
-        external
-        onlyOwner
-        returns (uint256 requestId)
-    {
-        require(wordsToRequest > 0 && wordsToRequest <= 10, "numWords must be 1-10");
-
-        // Request random words from coordinator
-        requestId = s_vrfCoordinator.requestRandomWords(
-            VRFV2PlusClient.RandomWordsRequest({
-                keyHash: keyHash,
-                subId: s_subscriptionId,
-                requestConfirmations: requestConfirmations,
-                callbackGasLimit: callbackGasLimit,
-                numWords: wordsToRequest,
-                extraArgs: VRFV2PlusClient._argsToBytes(
-                    VRFV2PlusClient.ExtraArgsV1({nativePayment: enableNativePayment})
-                )
-            })
-        );
-
-        // Store test request info
-        testVRFRequests[requestId] = TestVRFRequest({
-            exists: true,
-            fulfilled: false,
-            requestTime: block.timestamp,
-            randomWords: new uint256[](0)
-        });
-
-        lastTestRequestId = requestId;
-
-        emit TestVRFRequested(requestId, block.timestamp);
-
-        return requestId;
-    }
-
-    /**
-     * @notice Chainlink VRF v2.5 callback - settles match results or test requests
+     * @notice Chainlink VRF v2.5 callback - settles match results
      */
     function fulfillRandomWords(
         uint256 requestId,
         uint256[] calldata randomWords
     ) internal override {
-        // Check if this is a test VRF request
-        if (testVRFRequests[requestId].exists) {
-            TestVRFRequest storage testRequest = testVRFRequests[requestId];
-            require(!testRequest.fulfilled, "Test request already fulfilled");
-
-            // Mark as fulfilled and store random words
-            testRequest.fulfilled = true;
-
-            // Copy random words to storage
-            for (uint256 i = 0; i < randomWords.length; i++) {
-                testRequest.randomWords.push(randomWords[i]);
-            }
-
-            emit TestVRFFulfilled(requestId, randomWords);
-            return;
-        }
-
-        // Otherwise, handle normal round settlement
+        // Handle round settlement
         RequestStatus storage request = vrfRequests[requestId];
         require(request.exists, "Invalid request ID");
         require(!request.fulfilled, "Already fulfilled");
@@ -510,53 +446,8 @@ contract GameEngine is VRFConsumerBaseV2Plus {
      * @notice Calculate initial odds based on team season performance
      * @dev Odds are scaled by 100 (e.g., 150 = 1.5x payout)
      */
-    function _calculateInitialOdds(
-        uint256 seasonId,
-        uint256 homeTeamId,
-        uint256 awayTeamId
-    ) private view returns (uint256 homeOdds, uint256 awayOdds, uint256 drawOdds) {
-        Team memory homeTeam = seasonStandings[seasonId][homeTeamId];
-        Team memory awayTeam = seasonStandings[seasonId][awayTeamId];
-
-        // If no games played yet (first round), use default balanced odds
-        uint256 homeTotalGames = homeTeam.wins + homeTeam.draws + homeTeam.losses;
-        uint256 awayTotalGames = awayTeam.wins + awayTeam.draws + awayTeam.losses;
-
-        if (homeTotalGames == 0 || awayTotalGames == 0) {
-            // Default odds: slight home advantage
-            return (180, 220, 300); // 1.8x home, 2.2x away, 3.0x draw
-        }
-
-        // Calculate team strengths (0-100 scale)
-        uint256 homeStrength = (homeTeam.points * 100) / (homeTotalGames * 3);
-        int256 homeGoalDiff = int256(homeTeam.goalsFor) - int256(homeTeam.goalsAgainst);
-        homeStrength = homeStrength + uint256(homeGoalDiff > 0 ? homeGoalDiff : -homeGoalDiff) / homeTotalGames;
-
-        uint256 awayStrength = (awayTeam.points * 100) / (awayTotalGames * 3);
-        int256 awayGoalDiff = int256(awayTeam.goalsFor) - int256(awayTeam.goalsAgainst);
-        awayStrength = awayStrength + uint256(awayGoalDiff > 0 ? awayGoalDiff : -awayGoalDiff) / awayTotalGames;
-
-        // Add home advantage (10% boost to home strength)
-        homeStrength = (homeStrength * 110) / 100;
-
-        // Base odds calculation
-        uint256 totalStrength = homeStrength + awayStrength + 50; // +50 for draw probability
-
-        // Calculate implied probabilities and convert to odds
-        homeOdds = (totalStrength * 100) / (homeStrength > 0 ? homeStrength : 1);
-        awayOdds = (totalStrength * 100) / (awayStrength > 0 ? awayStrength : 1);
-        drawOdds = (totalStrength * 100) / 50;
-
-        // Apply bounds (minimum 1.2x, maximum 5.0x)
-        if (homeOdds < 120) homeOdds = 120;
-        if (homeOdds > 500) homeOdds = 500;
-        if (awayOdds < 120) awayOdds = 120;
-        if (awayOdds > 500) awayOdds = 500;
-        if (drawOdds < 200) drawOdds = 200;
-        if (drawOdds > 500) drawOdds = 500;
-
-        return (homeOdds, awayOdds, drawOdds);
-    }
+    // Odds calculation removed - now handled by BettingPool
+    // GameEngine only manages matches and VRF results
 
     // View functions for frontend
     function getCurrentRound() external view returns (uint256) {
@@ -626,68 +517,16 @@ contract GameEngine is VRFConsumerBaseV2Plus {
         return (request.exists, request.fulfilled, request.roundId);
     }
 
-    /**
-     * @notice Get test VRF request status and results
-     * @param requestId The VRF request ID
-     * @return exists Whether the request exists
-     * @return fulfilled Whether the request has been fulfilled
-     * @return requestTime When the request was made
-     * @return randomWords The random words received (empty if not fulfilled)
-     */
-    function getTestVRFResult(uint256 requestId)
-        external
-        view
-        returns (
-            bool exists,
-            bool fulfilled,
-            uint256 requestTime,
-            uint256[] memory randomWords
-        )
-    {
-        TestVRFRequest storage testRequest = testVRFRequests[requestId];
-        return (
-            testRequest.exists,
-            testRequest.fulfilled,
-            testRequest.requestTime,
-            testRequest.randomWords
-        );
-    }
-
-    /**
-     * @notice Get the last test VRF request ID and its status
-     * @return requestId The last test request ID (0 if none)
-     * @return exists Whether the request exists
-     * @return fulfilled Whether the request has been fulfilled
-     * @return requestTime When the request was made
-     * @return randomWords The random words received
-     */
-    function getLastTestVRFResult()
-        external
-        view
-        returns (
-            uint256 requestId,
-            bool exists,
-            bool fulfilled,
-            uint256 requestTime,
-            uint256[] memory randomWords
-        )
-    {
-        requestId = lastTestRequestId;
-        if (requestId == 0) {
-            return (0, false, false, 0, new uint256[](0));
-        }
-
-        TestVRFRequest storage testRequest = testVRFRequests[requestId];
-        return (
-            requestId,
-            testRequest.exists,
-            testRequest.fulfilled,
-            testRequest.requestTime,
-            testRequest.randomWords
-        );
-    }
-
     // Admin functions
+
+    /**
+     * @notice Set the BettingPool address for auto-seeding
+     * @param _bettingPool Address of the BettingPool contract
+     */
+    function setBettingPool(address _bettingPool) external onlyOwner {
+        bettingPool = _bettingPool;
+    }
+
     function updateVRFConfig(
         uint32 _callbackGasLimit,
         uint16 _requestConfirmations,

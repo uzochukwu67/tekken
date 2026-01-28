@@ -118,7 +118,7 @@ contract SeasonPredictorV2 is Ownable {
 
     /**
      * @notice Make a free prediction for season winner
-     * @dev Can only predict before round 1 starts (during round 0)
+     * @dev Can only predict before round 10 completes (users have half-season data)
      * @param teamId Team predicted to win (0-19)
      */
     function makePrediction(uint256 teamId) external {
@@ -133,8 +133,8 @@ contract SeasonPredictorV2 is Ownable {
         IGameEngine.Season memory season = gameEngine.getSeason(seasonId);
         if (!season.active) revert SeasonNotActive();
 
-        // Can only predict during round 0 (before season starts)
-        if (season.currentRound > 0) revert PredictionsLocked();
+        // Can only predict through round 10 (half-season window for informed predictions)
+        if (season.currentRound > 10) revert PredictionsLocked();
 
         // Check if user already predicted
         if (userPredictions[seasonId][msg.sender] != 0) revert AlreadyPredicted();

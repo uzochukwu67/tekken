@@ -128,6 +128,12 @@ forge script script/DeployBettingPoolV2.s.sol:DeployBettingPoolV2 \
     --verify
 ```
 
+
+forge script script/DeployGameEngineV2_5.s.sol:DeployGameEngineV2_5 \
+    --rpc-url $SEPOLIA_RPC_URL \
+    --broadcast \
+    --verify
+
 ### Post-Deployment Setup
 
 #### Option 1: Pay with LINK (Recommended)
