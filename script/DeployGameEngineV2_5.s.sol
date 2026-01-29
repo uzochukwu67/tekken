@@ -67,7 +67,10 @@ contract DeployGameEngineV2_5 is Script {
         // 6. Link contracts
         console.log("\n6. Linking contracts...");
         liquidityPool.setAuthorizedCaller(address(bettingPool), true);
-        console.log("LiquidityPoolV2.setAuthorizedCaller() called");
+        console.log("LiquidityPoolV2.setAuthorizedCaller(bettingPool) called");
+
+        gameEngine.setBettingPool(address(bettingPool));
+        console.log("GameEngine.setBettingPool() called");
 
         vm.stopBroadcast();
 
