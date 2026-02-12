@@ -16,3 +16,10 @@ docs/
 # Node modules
 node_modules/
 automation/node_modules/
+test-betting-flow.sh
+
+.env
+.env.local
+.env.example
+
+settle-round.sh

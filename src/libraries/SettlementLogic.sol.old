@@ -1,0 +1,329 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "./DataTypes.sol";
+import "./Constants.sol";
+import "./ValidationLogic.sol";
+import "./OddsLogic.sol";
+import "../storage/BettingStorage.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+interface ILiquidityPoolV3 {
+    function returnBorrowedFunds(uint256 amount) external;
+}
+
+/**
+ * @title SettlementLogic
+ * @notice Round settlement and bet resolution logic
+ * @dev Handles determining winners, calculating reserves, and updating bet statuses
+ */
+library SettlementLogic {
+    // ============ Events ============
+
+    event RoundSettled(
+        uint256 indexed roundId,
+        uint256 totalWinningPool,
+        uint256 totalLosingPool,
+        uint256 totalReserved
+    );
+
+    event BetResolved(
+        uint256 indexed betId,
+        address indexed bettor,
+        bool won,
+        uint256 potentialPayout
+    );
+
+    event RevenueDistributed(
+        uint256 indexed roundId,
+        uint256 protocolShare,
+        uint256 lpShare,
+        uint256 seasonShare
+    );
+
+    // ============ Errors ============
+
+    error NoResultsProvided();
+    error RoundHasNoBets();
+
+    // ============ Settlement ============
+
+    /**
+     * @notice Settle a round with match results
+     * @param params Settlement parameters including results
+     */
+    function settleRound(DataTypes.SettlementParams memory params) internal {
+        // Validate
+        ValidationLogic.validateSettlementParams(params);
+
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        DataTypes.RoundAccounting storage accounting = s.roundAccounting[params.roundId];
+        DataTypes.RoundMetadata storage metadata = s.roundMetadata[params.roundId];
+
+        // Lock odds before settlement
+        OddsLogic.lockRoundOdds(params.roundId);
+
+        // Calculate winning/losing pools
+        (uint256 totalWinning, uint256 totalLosing) = _calculatePoolTotals(
+            params.roundId,
+            params.results
+        );
+
+        // Update accounting
+        accounting.totalWinningPool = uint128(totalWinning);
+        accounting.totalLosingPool = uint128(totalLosing);
+
+        // Process all bets
+        uint256 totalReserved = _processBets(params.roundId, params.results);
+        accounting.totalReservedForWinners = uint128(totalReserved);
+
+        // Mark settled
+        metadata.settled = true;
+        metadata.roundEndTime = uint64(block.timestamp);
+
+        emit RoundSettled(
+            params.roundId,
+            totalWinning,
+            totalLosing,
+            totalReserved
+        );
+    }
+
+    /**
+     * @notice Calculate total winning and losing pools
+     */
+    function _calculatePoolTotals(
+        uint256 roundId,
+        uint8[] memory results
+    ) private view returns (uint256 totalWinning, uint256 totalLosing) {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+
+        for (uint256 i = 0; i < Constants.MAX_MATCHES_PER_ROUND; i++) {
+            DataTypes.MatchPool storage pool = s.matchPools[roundId][i];
+            uint8 result = results[i];
+
+            uint256 winningPool;
+            uint256 losingPool;
+
+            if (result == Constants.OUTCOME_HOME_WIN) {
+                winningPool = pool.homeWinPool;
+                losingPool = pool.awayWinPool + pool.drawPool;
+            } else if (result == Constants.OUTCOME_AWAY_WIN) {
+                winningPool = pool.awayWinPool;
+                losingPool = pool.homeWinPool + pool.drawPool;
+            } else {
+                winningPool = pool.drawPool;
+                losingPool = pool.homeWinPool + pool.awayWinPool;
+            }
+
+            totalWinning += winningPool;
+            totalLosing += losingPool;
+        }
+    }
+
+    /**
+     * @notice Process all bets for a round
+     * @return totalReserved Total amount reserved for winners
+     */
+    function _processBets(
+        uint256 roundId,
+        uint8[] memory results
+    ) private returns (uint256 totalReserved) {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+
+        // Iterate through all bets (this is expensive but necessary)
+        // In production, consider off-chain indexing + merkle proofs
+        for (uint256 betId = 0; betId < s.nextBetId; betId++) {
+            DataTypes.Bet storage bet = s.bets[betId];
+
+            // Skip if not this round or not active
+            if (bet.roundId != roundId) continue;
+            if (bet.status != DataTypes.BetStatus.Active) continue;
+
+            // Check if bet won
+            bool won = _checkBetWon(betId, results);
+
+            if (won) {
+                bet.status = DataTypes.BetStatus.Won;
+
+                // Calculate payout
+                uint256 payout = _calculateBetPayout(betId, bet);
+                totalReserved += payout;
+
+                emit BetResolved(betId, bet.bettor, true, payout);
+            } else {
+                bet.status = DataTypes.BetStatus.Lost;
+                emit BetResolved(betId, bet.bettor, false, 0);
+            }
+        }
+    }
+
+    /**
+     * @notice Check if a bet won (all predictions correct)
+     */
+    function _checkBetWon(
+        uint256 betId,
+        uint8[] memory results
+    ) private view returns (bool) {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        DataTypes.Prediction[] storage predictions = s.betPredictions[betId].predictions;
+
+        for (uint256 i = 0; i < predictions.length; i++) {
+            uint8 matchIndex = predictions[i].matchIndex;
+            uint8 predicted = predictions[i].predictedOutcome;
+            uint8 actual = results[matchIndex];
+
+            if (predicted != actual) {
+                return false; // Any wrong prediction = loss
+            }
+        }
+
+        return true; // All predictions correct
+    }
+
+    /**
+     * @notice Calculate payout for a winning bet
+     */
+    function _calculateBetPayout(
+        uint256 betId,
+        DataTypes.Bet storage bet
+    ) private view returns (uint256 payout) {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        DataTypes.Prediction[] storage predictions = s.betPredictions[betId].predictions;
+
+        // Build arrays for odds calculation
+        uint256[] memory matchIndices = new uint256[](predictions.length);
+        uint8[] memory outcomes = new uint8[](predictions.length);
+
+        for (uint256 i = 0; i < predictions.length; i++) {
+            matchIndices[i] = predictions[i].matchIndex;
+            outcomes[i] = predictions[i].predictedOutcome;
+        }
+
+        // Calculate with locked multiplier
+        payout = OddsLogic.calculateFullPayout(
+            bet.amount,
+            matchIndices,
+            outcomes,
+            bet.roundId,
+            bet.lockedMultiplier
+        );
+
+        // Cap at max payout
+        if (payout > Constants.MAX_PAYOUT_PER_BET) {
+            payout = Constants.MAX_PAYOUT_PER_BET;
+        }
+    }
+
+    // ============ Revenue Distribution ============
+
+    /**
+     * @notice Finalize round revenue distribution for a specific token
+     * @param roundId The round to finalize
+     * @param token The token to distribute
+     * @return params Revenue distribution parameters
+     */
+    function finalizeRevenue(
+        uint256 roundId,
+        address token
+    ) internal returns (DataTypes.RevenueParams memory params) {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        DataTypes.RoundAccounting storage accounting = s.roundAccounting[roundId];
+        DataTypes.RoundMetadata storage metadata = s.roundMetadata[roundId];
+
+        require(metadata.settled, "Round not settled");
+        require(!metadata.revenueDistributed, "Already distributed");
+
+        // Calculate net profit/loss
+        uint256 totalIn = accounting.totalBetVolume;
+        uint256 totalOut = accounting.totalPaidOut;
+
+        params.roundId = roundId;
+
+        if (totalIn > totalOut) {
+            // Profit scenario
+            params.netProfit = totalIn - totalOut;
+
+            // Split profits: 2% protocol, 2% season, 96% LP
+            params.protocolShare = (params.netProfit * Constants.PROTOCOL_FEE_BPS) / Constants.BPS_PRECISION;
+            params.seasonShare = (params.netProfit * Constants.SEASON_POOL_FEE_BPS) / Constants.BPS_PRECISION;
+            params.lpShare = params.netProfit - params.protocolShare - params.seasonShare;
+
+            // Transfer LP share back to pool
+            if (params.lpShare > 0) {
+                address pool = s.tokenToPool[token];
+                if (pool != address(0)) {
+                    // Approve and transfer to pool
+                    IERC20(token).approve(pool, params.lpShare);
+                    ILiquidityPoolV3(pool).returnBorrowedFunds(params.lpShare);
+                }
+            }
+        } else {
+            // Loss scenario - LP covers
+            params.netProfit = 0;
+            params.protocolShare = 0;
+            params.seasonShare = 0;
+            params.lpShare = 0;
+        }
+
+        // Update metadata
+        metadata.protocolRevenueShare = uint128(params.protocolShare);
+        metadata.seasonRevenueShare = uint128(params.seasonShare);
+        metadata.lpRevenueShare = uint128(params.lpShare);
+        metadata.revenueDistributed = true;
+
+        // Update season pool
+        s.seasonRewardPool += params.seasonShare;
+        s.totalProtocolFees += params.protocolShare;
+
+        emit RevenueDistributed(
+            roundId,
+            params.protocolShare,
+            params.lpShare,
+            params.seasonShare
+        );
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get round settlement summary
+     */
+    function getRoundSummary(
+        uint256 roundId
+    ) internal view returns (DataTypes.RoundSummary memory summary) {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        DataTypes.RoundAccounting storage accounting = s.roundAccounting[roundId];
+        DataTypes.RoundMetadata storage metadata = s.roundMetadata[roundId];
+
+        summary.roundId = roundId;
+        summary.totalVolume = accounting.totalBetVolume;
+        summary.parlayCount = accounting.parlayCount;
+        summary.startTime = metadata.roundStartTime;
+        summary.endTime = metadata.roundEndTime;
+
+        // Determine status
+        if (!metadata.seeded) {
+            summary.status = DataTypes.RoundStatus.Created;
+        } else if (!metadata.settled) {
+            summary.status = DataTypes.RoundStatus.Seeded;
+        } else if (!metadata.revenueDistributed) {
+            summary.status = DataTypes.RoundStatus.Settled;
+        } else {
+            summary.status = DataTypes.RoundStatus.Finalized;
+        }
+    }
+
+    /**
+     * @notice Check if bet is a winner
+     * @param betId The bet ID
+     * @param results Match results array
+     * @return won Whether the bet won
+     */
+    function isBetWinner(
+        uint256 betId,
+        uint8[] memory results
+    ) internal view returns (bool won) {
+        return _checkBetWon(betId, results);
+    }
+}

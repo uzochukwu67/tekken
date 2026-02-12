@@ -1,0 +1,310 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "./DataTypes.sol";
+import "./Constants.sol";
+import "../storage/BettingStorage.sol";
+
+/**
+ * @notice Interface for LiquidityPool
+ */
+interface ILiquidityPool {
+    function token() external view returns (address);
+    function getPoolUtilization() external view returns (
+        uint256 totalLiquidity,
+        uint256 lockedLiquidity,
+        uint256 availableLiquidity,
+        uint256 utilizationBps
+    );
+}
+
+/**
+ * @title ValidationLogic
+ * @notice Input validation for betting operations
+ * @dev All validation logic centralized here for consistency and gas optimization
+ *      Reverts with descriptive errors on invalid input
+ */
+library ValidationLogic {
+    // ============ Errors ============
+
+    error InvalidToken();
+    error TokenNotSupported();
+    error ZeroAmount();
+    error AmountTooLow(uint256 amount, uint256 minimum);
+    error AmountTooHigh(uint256 amount, uint256 maximum);
+    error InvalidMatchIndex(uint256 index, uint256 maxIndex);
+    error InvalidOutcome(uint8 outcome);
+    error DuplicateMatch(uint256 matchIndex);
+    error TooManyMatches(uint256 count, uint256 maximum);
+    error TooFewMatches(uint256 count, uint256 minimum);
+    error ArrayLengthMismatch(uint256 len1, uint256 len2);
+    error RoundNotSeeded(uint256 roundId);
+    error RoundAlreadySeeded(uint256 roundId);
+    error RoundNotSettled(uint256 roundId);
+    error RoundAlreadySettled(uint256 roundId);
+    error RoundNotActive(uint256 roundId);
+    error BettingClosed(uint256 roundId);
+    error BetNotFound(uint256 betId);
+    error BetAlreadyClaimed(uint256 betId);
+    error BetAlreadyCancelled(uint256 betId);
+    error BetNotWon(uint256 betId);
+    error NotBetOwner(address caller, address owner);
+    error PayoutTooLow(uint256 payout, uint256 minimum);
+    error InsufficientLiquidity(uint256 required, uint256 available);
+    error ContractPaused();
+    error BettingDisabled();
+    error ZeroAddress();
+
+    // ============ Bet Validation ============
+
+    /**
+     * @notice Validate bet placement parameters
+     * @param params The bet parameters to validate
+     */
+    function validatePlaceBetParams(
+        DataTypes.PlaceBetParams memory params
+    ) internal view {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+
+        // Check pause state
+        if (s.paused) revert ContractPaused();
+        if (!s.bettingEnabled) revert BettingDisabled();
+
+        // Validate token
+        if (params.token == address(0)) revert InvalidToken();
+        if (!s.supportedTokens[params.token]) revert TokenNotSupported();
+
+        // Validate amount
+        if (params.amount == 0) revert ZeroAmount();
+        if (params.amount < s.limits.minBetAmount) {
+            revert AmountTooLow(params.amount, s.limits.minBetAmount);
+        }
+        if (params.amount > s.limits.maxBetAmount) {
+            revert AmountTooHigh(params.amount, s.limits.maxBetAmount);
+        }
+
+        // Validate arrays
+        if (params.matchIndices.length != params.predictions.length) {
+            revert ArrayLengthMismatch(params.matchIndices.length, params.predictions.length);
+        }
+        if (params.matchIndices.length < Constants.MIN_MATCHES_PER_BET) {
+            revert TooFewMatches(params.matchIndices.length, Constants.MIN_MATCHES_PER_BET);
+        }
+        if (params.matchIndices.length > Constants.MAX_MATCHES_PER_BET) {
+            revert TooManyMatches(params.matchIndices.length, Constants.MAX_MATCHES_PER_BET);
+        }
+
+        // Validate each prediction
+        _validatePredictions(params.matchIndices, params.predictions);
+    }
+
+    /**
+     * @notice Validate predictions array
+     * @dev Checks for valid indices, outcomes, and duplicates
+     */
+    function _validatePredictions(
+        uint256[] memory matchIndices,
+        uint8[] memory predictions
+    ) private pure {
+        // Track seen matches to detect duplicates
+        uint256 seenMask;
+
+        for (uint256 i = 0; i < matchIndices.length; i++) {
+            uint256 matchIndex = matchIndices[i];
+
+            // Validate match index
+            if (matchIndex >= Constants.MAX_MATCHES_PER_ROUND) {
+                revert InvalidMatchIndex(matchIndex, Constants.MAX_MATCHES_PER_ROUND - 1);
+            }
+
+            // Check for duplicate (using bitmap)
+            uint256 bit = 1 << matchIndex;
+            if (seenMask & bit != 0) {
+                revert DuplicateMatch(matchIndex);
+            }
+            seenMask |= bit;
+
+            // Validate outcome
+            uint8 outcome = predictions[i];
+            if (outcome < Constants.OUTCOME_HOME_WIN || outcome > Constants.OUTCOME_DRAW) {
+                revert InvalidOutcome(outcome);
+            }
+        }
+    }
+
+    // ============ Round Validation ============
+
+    /**
+     * @notice Validate round is seeded and accepting bets
+     * @param roundId The round to validate
+     */
+    function validateRoundForBetting(uint256 roundId) internal view {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        DataTypes.RoundMetadata storage meta = s.roundMetadata[roundId];
+
+        if (!meta.seeded) revert RoundNotSeeded(roundId);
+        if (meta.settled) revert RoundAlreadySettled(roundId);
+
+        // Check betting window
+        if (block.timestamp >= meta.roundEndTime - Constants.BETTING_CUTOFF) {
+            revert BettingClosed(roundId);
+        }
+    }
+
+    /**
+     * @notice Validate round can be seeded
+     * @param roundId The round to validate
+     */
+    function validateRoundForSeeding(uint256 roundId) internal view {
+        DataTypes.RoundMetadata storage meta = BettingStorage.getRoundMetadata(roundId);
+
+        if (meta.seeded) revert RoundAlreadySeeded(roundId);
+    }
+
+    /**
+     * @notice Validate round can be settled
+     * @param roundId The round to validate
+     */
+    function validateRoundForSettlement(uint256 roundId) internal view {
+        DataTypes.RoundMetadata storage meta = BettingStorage.getRoundMetadata(roundId);
+
+        if (!meta.seeded) revert RoundNotSeeded(roundId);
+        if (meta.settled) revert RoundAlreadySettled(roundId);
+    }
+
+    // ============ Bet Validation ============
+
+    /**
+     * @notice Validate bet exists and is in expected state
+     * @param betId The bet ID to validate
+     * @return bet The bet data
+     */
+    function validateBetExists(uint256 betId) internal view returns (DataTypes.Bet storage bet) {
+        bet = BettingStorage.getBet(betId);
+        if (bet.bettor == address(0)) revert BetNotFound(betId);
+    }
+
+    /**
+     * @notice Validate bet can be claimed
+     * @param betId The bet ID to validate
+     * @param claimer The address attempting to claim
+     */
+    function validateBetForClaim(
+        uint256 betId,
+        address claimer
+    ) internal view returns (DataTypes.Bet storage bet) {
+        bet = validateBetExists(betId);
+
+        if (bet.bettor != claimer) revert NotBetOwner(claimer, bet.bettor);
+        if (bet.status == DataTypes.BetStatus.Claimed) revert BetAlreadyClaimed(betId);
+        if (bet.status == DataTypes.BetStatus.Cancelled) revert BetAlreadyCancelled(betId);
+        if (bet.status != DataTypes.BetStatus.Won) revert BetNotWon(betId);
+
+        // Validate round is settled
+        DataTypes.RoundMetadata storage meta = BettingStorage.getRoundMetadata(bet.roundId);
+        if (!meta.settled) revert RoundNotSettled(bet.roundId);
+    }
+
+    /**
+     * @notice Validate bet can be cancelled
+     * @param betId The bet ID to validate
+     * @param caller The address attempting to cancel
+     */
+    function validateBetForCancellation(
+        uint256 betId,
+        address caller
+    ) internal view returns (DataTypes.Bet storage bet) {
+        bet = validateBetExists(betId);
+
+        if (bet.bettor != caller) revert NotBetOwner(caller, bet.bettor);
+        if (bet.status != DataTypes.BetStatus.Active) {
+            if (bet.status == DataTypes.BetStatus.Cancelled) revert BetAlreadyCancelled(betId);
+            if (bet.status == DataTypes.BetStatus.Claimed) revert BetAlreadyClaimed(betId);
+        }
+
+        // Check round not settled
+        DataTypes.RoundMetadata storage meta = BettingStorage.getRoundMetadata(bet.roundId);
+        if (meta.settled) revert RoundAlreadySettled(bet.roundId);
+    }
+
+    // ============ Claim Validation ============
+
+    /**
+     * @notice Validate claim parameters
+     * @param params The claim parameters
+     */
+    function validateClaimParams(DataTypes.ClaimParams memory params) internal view {
+        if (params.claimer == address(0)) revert ZeroAddress();
+        validateBetForClaim(params.betId, params.claimer);
+    }
+
+    // ============ LP Validation ============
+
+    /**
+     * @notice Validate LP operation parameters
+     * @param params The LP operation parameters
+     */
+    function validateLPParams(DataTypes.LPParams memory params) internal view {
+        if (params.lpProvider == address(0)) revert ZeroAddress();
+        if (params.token == address(0)) revert InvalidToken();
+        if (params.amount == 0) revert ZeroAmount();
+
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        if (!s.supportedTokens[params.token]) revert TokenNotSupported();
+    }
+
+    /**
+     * @notice Validate sufficient liquidity exists to cover potential payout
+     * @param token The token to check liquidity for
+     * @param potentialPayout The potential payout amount that needs to be covered
+     * @dev This validates that the LP has enough available liquidity to pay out
+     *      the bet if it wins, preventing acceptance of unpayable bets
+     */
+    function validateSufficientLiquidity(address token, uint256 potentialPayout) internal view {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+
+        // Get the liquidity pool for this token
+        address pool = s.tokenToPool[token];
+
+        if (pool == address(0)) {
+            revert InsufficientLiquidity(potentialPayout, 0);
+        }
+
+        // Verify the pool manages the correct token
+        address poolToken = ILiquidityPool(pool).token();
+        if (poolToken != token) {
+            revert InvalidToken();
+        }
+
+        // Query available liquidity from the pool
+        (,, uint256 available,) = ILiquidityPool(pool).getPoolUtilization();
+
+        // Check if available liquidity can cover the potential payout
+        if (available < potentialPayout) {
+            revert InsufficientLiquidity(potentialPayout, available);
+        }
+    }
+
+    // ============ Settlement Validation ============
+
+    /**
+     * @notice Validate settlement parameters
+     * @param params The settlement parameters
+     */
+    function validateSettlementParams(DataTypes.SettlementParams memory params) internal view {
+        validateRoundForSettlement(params.roundId);
+
+        // Validate results array
+        if (params.results.length != Constants.MAX_MATCHES_PER_ROUND) {
+            revert ArrayLengthMismatch(params.results.length, Constants.MAX_MATCHES_PER_ROUND);
+        }
+
+        // Validate each result
+        for (uint256 i = 0; i < params.results.length; i++) {
+            uint8 result = params.results[i];
+            if (result < Constants.OUTCOME_HOME_WIN || result > Constants.OUTCOME_DRAW) {
+                revert InvalidOutcome(result);
+            }
+        }
+    }
+}

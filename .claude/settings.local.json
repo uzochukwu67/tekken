@@ -4,7 +4,15 @@
       "Bash(npm install:*)",
       "Bash(forge test:*)",
       "Bash(forge build:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(chmod:*)",
+      "Bash(PRIVATE_KEY=0x7125ce4cebbdcd9d76871c1b8a10b65034142ade2f0129c9eba244bb2a9c100f)",
+      "Bash(RPC=\"https://ethereum-sepolia-rpc.publicnode.com\")",
+      "Bash(BETTING_CORE=\"0x5055B6f64c79789EE4e7962B6EbB6298617efB31\")",
+      "Bash(cast send:*)",
+      "Bash(node --loader tsx/esm:*)",
+      "Bash(node extract-abis.js:*)",
+      "Bash(cast call:*)"
     ]
   }
 }

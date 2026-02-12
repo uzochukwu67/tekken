@@ -1,0 +1,273 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "./DataTypes.sol";
+import "./Constants.sol";
+import "./ValidationLogic.sol";
+import "./OddsLogic.sol";
+import "../storage/BettingStorage.sol";
+
+/**
+ * @title PayoutLogic
+ * @notice Claim and payout processing logic
+ * @dev Handles winner claims, payout calculations, and LP interactions
+ */
+library PayoutLogic {
+    using SafeERC20 for IERC20;
+
+    // ============ Events ============
+
+    event WinningsClaimed(
+        uint256 indexed betId,
+        address indexed bettor,
+        address indexed token,
+        uint256 payout
+    );
+
+    event PayoutProcessed(
+        uint256 indexed betId,
+        uint256 basePayout,
+        uint256 parlayBonus,
+        uint256 finalPayout
+    );
+
+    // ============ Errors ============
+
+    error PayoutBelowMinimum(uint256 payout, uint256 minimum);
+    error InsufficientContractBalance(uint256 required, uint256 available);
+
+    // ============ Claim Functions ============
+
+    /**
+     * @notice Claim winnings for a winning bet
+     * @param params Claim parameters
+     * @return payout The amount paid out
+     */
+    function claimWinnings(
+        DataTypes.ClaimParams memory params
+    ) internal returns (uint256 payout) {
+        // Validate
+        DataTypes.Bet storage bet = ValidationLogic.validateBetForClaim(
+            params.betId,
+            params.claimer
+        );
+
+        // Calculate payout
+        payout = calculatePayout(params.betId);
+
+        // Check minimum payout (slippage protection)
+        if (payout < params.minPayout) {
+            revert PayoutBelowMinimum(payout, params.minPayout);
+        }
+
+        // Update bet status
+        bet.status = DataTypes.BetStatus.Claimed;
+
+        // Update round accounting
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        DataTypes.RoundAccounting storage accounting = s.roundAccounting[bet.roundId];
+        accounting.totalClaimed += uint128(payout);
+        accounting.totalPaidOut += uint128(payout);
+
+        // Transfer payout
+        _processPayout(bet.bettor, bet.token, payout);
+
+        emit WinningsClaimed(params.betId, bet.bettor, bet.token, payout);
+    }
+
+    /**
+     * @notice Calculate payout for a bet
+     * @param betId The bet ID
+     * @return payout The calculated payout amount
+     */
+    function calculatePayout(uint256 betId) internal view returns (uint256 payout) {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        DataTypes.Bet storage bet = s.bets[betId];
+        DataTypes.Prediction[] storage predictions = s.betPredictions[betId].predictions;
+
+        // Build arrays for calculation
+        uint256[] memory matchIndices = new uint256[](predictions.length);
+        uint8[] memory outcomes = new uint8[](predictions.length);
+
+        for (uint256 i = 0; i < predictions.length; i++) {
+            matchIndices[i] = predictions[i].matchIndex;
+            outcomes[i] = predictions[i].predictedOutcome;
+        }
+
+        // Calculate base payout from odds
+        (uint256 basePayout, ) = OddsLogic.calculateBasePayout(
+            bet.amount,
+            matchIndices,
+            outcomes,
+            bet.roundId
+        );
+
+        // Apply locked parlay multiplier
+        payout = (basePayout * bet.lockedMultiplier) / Constants.PRECISION;
+
+        // Cap at max payout
+        if (payout > Constants.MAX_PAYOUT_PER_BET) {
+            payout = Constants.MAX_PAYOUT_PER_BET;
+        }
+    }
+
+    /**
+     * @notice Process the actual payout transfer
+     */
+    function _processPayout(
+        address recipient,
+        address token,
+        uint256 amount
+    ) private {
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        if (balance < amount) {
+            revert InsufficientContractBalance(amount, balance);
+        }
+
+        IERC20(token).safeTransfer(recipient, amount);
+    }
+
+    // ============ Batch Operations ============
+
+    /**
+     * @notice Claim multiple bets in one transaction
+     * @param betIds Array of bet IDs to claim
+     * @param claimer The address claiming
+     * @return totalPayout Total amount paid out
+     */
+    function batchClaim(
+        uint256[] memory betIds,
+        address claimer
+    ) internal returns (uint256 totalPayout) {
+        for (uint256 i = 0; i < betIds.length; i++) {
+            // Check if claimable before attempting
+            (bool claimable, ) = isClaimable(betIds[i]);
+            if (!claimable) continue;
+
+            // Verify ownership
+            BettingStorage.Layout storage s = BettingStorage.layout();
+            DataTypes.Bet storage bet = s.bets[betIds[i]];
+            if (bet.bettor != claimer) continue;
+
+            DataTypes.ClaimParams memory params = DataTypes.ClaimParams({
+                betId: betIds[i],
+                claimer: claimer,
+                minPayout: 0 // No slippage check for batch
+            });
+
+            uint256 payout = claimWinnings(params);
+            totalPayout += payout;
+        }
+    }
+
+    // ============ Payout Breakdown ============
+
+    /**
+     * @notice Get detailed payout breakdown
+     * @param betId The bet ID
+     * @return basePayout Base payout from odds
+     * @return parlayBonus Additional parlay bonus
+     * @return finalPayout Total payout
+     */
+    function getPayoutBreakdown(
+        uint256 betId
+    ) internal view returns (
+        uint256 basePayout,
+        uint256 parlayBonus,
+        uint256 finalPayout
+    ) {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        DataTypes.Bet storage bet = s.bets[betId];
+        DataTypes.Prediction[] storage predictions = s.betPredictions[betId].predictions;
+
+        // Build arrays
+        uint256[] memory matchIndices = new uint256[](predictions.length);
+        uint8[] memory outcomes = new uint8[](predictions.length);
+
+        for (uint256 i = 0; i < predictions.length; i++) {
+            matchIndices[i] = predictions[i].matchIndex;
+            outcomes[i] = predictions[i].predictedOutcome;
+        }
+
+        // Calculate base
+        (basePayout, ) = OddsLogic.calculateBasePayout(
+            bet.amount,
+            matchIndices,
+            outcomes,
+            bet.roundId
+        );
+
+        // Calculate final with multiplier
+        finalPayout = (basePayout * bet.lockedMultiplier) / Constants.PRECISION;
+
+        // Cap
+        if (finalPayout > Constants.MAX_PAYOUT_PER_BET) {
+            finalPayout = Constants.MAX_PAYOUT_PER_BET;
+        }
+
+        // Parlay bonus is the difference
+        if (finalPayout > basePayout) {
+            parlayBonus = finalPayout - basePayout;
+        }
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get user's total claimable amount
+     * @param user The user address
+     * @return totalClaimable Sum of all claimable payouts
+     * @return claimableBetIds Array of bet IDs that can be claimed
+     */
+    function getUserClaimable(
+        address user
+    ) internal view returns (uint256 totalClaimable, uint256[] memory claimableBetIds) {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        uint256[] storage userBetIds = s.userBets[user];
+
+        // Count claimable bets
+        uint256 count = 0;
+        for (uint256 i = 0; i < userBetIds.length; i++) {
+            DataTypes.Bet storage bet = s.bets[userBetIds[i]];
+            if (bet.status == DataTypes.BetStatus.Won) {
+                count++;
+            }
+        }
+
+        // Build result array
+        claimableBetIds = new uint256[](count);
+        uint256 idx = 0;
+
+        for (uint256 i = 0; i < userBetIds.length; i++) {
+            DataTypes.Bet storage bet = s.bets[userBetIds[i]];
+            if (bet.status == DataTypes.BetStatus.Won) {
+                claimableBetIds[idx] = userBetIds[i];
+                totalClaimable += calculatePayout(userBetIds[i]);
+                idx++;
+            }
+        }
+    }
+
+    /**
+     * @notice Check if a bet is claimable
+     * @param betId The bet ID
+     * @return claimable Whether the bet can be claimed
+     * @return payout The payout amount if claimable
+     */
+    function isClaimable(
+        uint256 betId
+    ) internal view returns (bool claimable, uint256 payout) {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        DataTypes.Bet storage bet = s.bets[betId];
+
+        if (bet.status == DataTypes.BetStatus.Won) {
+            DataTypes.RoundMetadata storage meta = s.roundMetadata[bet.roundId];
+            if (meta.settled) {
+                claimable = true;
+                payout = calculatePayout(betId);
+            }
+        }
+    }
+}

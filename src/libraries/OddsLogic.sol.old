@@ -1,0 +1,377 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "./DataTypes.sol";
+import "./Constants.sol";
+import "../storage/BettingStorage.sol";
+
+/**
+ * @title OddsLogic
+ * @notice Odds calculation and parlay multiplier logic
+ * @dev Implements parimutuel-style odds with compression and parlay bonuses
+ */
+library OddsLogic {
+    // ============ Errors ============
+
+    error OddsNotLocked(uint256 roundId, uint256 matchIndex);
+    error InvalidPoolState();
+
+    // ============ Odds Calculation ============
+
+    /**
+     * @notice Calculate current odds for a match outcome
+     * @dev Uses parimutuel formula: odds = totalPool / outcomePool
+     *      Compressed to 1.25x - 1.85x range for LP safety and balanced betting
+     * @param roundId The round ID
+     * @param matchIndex The match index (0-9)
+     * @param outcome The outcome to get odds for (1-3)
+     * @return odds The calculated odds (1e18 scale)
+     */
+    function calculateOdds(
+        uint256 roundId,
+        uint256 matchIndex,
+        uint8 outcome
+    ) internal view returns (uint256 odds) {
+        DataTypes.MatchPool storage pool = BettingStorage.getMatchPool(roundId, matchIndex);
+
+        if (pool.totalPool == 0) {
+            // No bets yet, return neutral odds
+            return 15e17; // 1.5x
+        }
+
+        uint256 outcomePool = _getOutcomePool(pool, outcome);
+        if (outcomePool == 0) {
+            // No bets on this outcome, max odds
+            return 19e17; // 1.9x
+        }
+
+        // Raw parimutuel odds
+        uint256 rawOdds = (uint256(pool.totalPool) * Constants.PRECISION) / outcomePool;
+
+        // Compress to safe range [1.3x - 1.7x]
+        odds = _compressOdds(rawOdds);
+    }
+
+    /**
+     * @notice DEBUG: Step-by-step odds calculation
+     */
+    function calculateOddsDebug(
+        uint256 roundId,
+        uint256 matchIndex,
+        uint8 outcome
+    ) internal view returns (
+        uint256 totalPool,
+        uint256 outcomePool,
+        bool totalIsZero,
+        bool outcomeIsZero,
+        uint256 rawOdds,
+        uint256 finalOdds
+    ) {
+        DataTypes.MatchPool storage pool = BettingStorage.getMatchPool(roundId, matchIndex);
+
+        totalPool = pool.totalPool;
+        totalIsZero = (pool.totalPool == 0);
+
+        if (totalIsZero) {
+            return (totalPool, 0, totalIsZero, true, 0, 15e17);
+        }
+
+        outcomePool = _getOutcomePool(pool, outcome);
+        outcomeIsZero = (outcomePool == 0);
+
+        if (outcomeIsZero) {
+            return (totalPool, outcomePool, totalIsZero, outcomeIsZero, 0, 19e17);
+        }
+
+        rawOdds = (uint256(pool.totalPool) * Constants.PRECISION) / outcomePool;
+        finalOdds = _compressOdds(rawOdds);
+    }
+
+    /**
+     * @notice Get locked odds for a match (set at betting close)
+     * @param roundId The round ID
+     * @param matchIndex The match index
+     * @param outcome The outcome (1-3)
+     * @return odds The locked odds (1e18 scale)
+     */
+    function getLockedOdds(
+        uint256 roundId,
+        uint256 matchIndex,
+        uint8 outcome
+    ) internal view returns (uint256 odds) {
+        DataTypes.LockedOdds storage locked = BettingStorage.getLockedOdds(roundId, matchIndex);
+
+        if (!locked.locked) revert OddsNotLocked(roundId, matchIndex);
+
+        if (outcome == Constants.OUTCOME_HOME_WIN) {
+            odds = uint256(locked.homeOdds) * 1e12; // Scale from 1e6 to 1e18
+        } else if (outcome == Constants.OUTCOME_AWAY_WIN) {
+            odds = uint256(locked.awayOdds) * 1e12;
+        } else {
+            odds = uint256(locked.drawOdds) * 1e12;
+        }
+    }
+
+    /**
+     * @notice Lock odds for all matches in a round
+     * @param roundId The round ID
+     */
+    function lockRoundOdds(uint256 roundId) internal {
+        for (uint256 i = 0; i < Constants.MAX_MATCHES_PER_ROUND; i++) {
+            _lockMatchOdds(roundId, i);
+        }
+    }
+
+    /**
+     * @notice Lock odds for a single match
+     */
+    function _lockMatchOdds(uint256 roundId, uint256 matchIndex) private {
+        DataTypes.LockedOdds storage locked = BettingStorage.getLockedOdds(roundId, matchIndex);
+
+        if (locked.locked) return; // Already locked
+
+        // Calculate and store compressed odds
+        uint256 homeOdds = calculateOdds(roundId, matchIndex, Constants.OUTCOME_HOME_WIN);
+        uint256 awayOdds = calculateOdds(roundId, matchIndex, Constants.OUTCOME_AWAY_WIN);
+        uint256 drawOdds = calculateOdds(roundId, matchIndex, Constants.OUTCOME_DRAW);
+
+        // Store as uint64 (scale down from 1e18 to 1e6 for packing)
+        locked.homeOdds = uint64(homeOdds / 1e12);
+        locked.awayOdds = uint64(awayOdds / 1e12);
+        locked.drawOdds = uint64(drawOdds / 1e12);
+        locked.locked = true;
+    }
+
+    /**
+     * @notice Compress odds to safe range with true linear compression
+     * @dev Maps raw parimutuel odds [1.0x - 10.0x] to target range [1.25x - 1.85x]
+     *      Uses linear interpolation for smooth compression
+     *
+     * Formula: compressed = minTarget + (raw - rawMin) × (maxTarget - minTarget) / (rawMax - rawMin)
+     *
+     * Example mappings:
+     * - 1.0x raw → 1.25x compressed (floor)
+     * - 1.5x raw → 1.28x compressed
+     * - 2.0x raw → 1.32x compressed
+     * - 3.0x raw → 1.45x compressed
+     * - 5.0x raw → 1.58x compressed
+     * - 10.0x raw → 1.85x compressed (ceiling)
+     */
+    function _compressOdds(uint256 rawOdds) private pure returns (uint256) {
+        // Target output range
+        uint256 minTarget = 125e16; // 1.25x
+        uint256 maxTarget = 185e16; // 1.85x
+
+        // Input range to compress FROM
+        uint256 rawMin = 10e17;  // 1.0x
+        uint256 rawMax = 100e17; // 10.0x
+
+        // Handle edge cases
+        if (rawOdds <= rawMin) return minTarget;
+        if (rawOdds >= rawMax) return maxTarget;
+
+        // Linear compression formula
+        // compressed = minTarget + (rawOdds - rawMin) × (range_target / range_raw)
+        uint256 rawRange = rawMax - rawMin;           // 9.0 (9e18)
+        uint256 targetRange = maxTarget - minTarget;  // 0.6 (6e17)
+
+        // Calculate: (rawOdds - rawMin) × targetRange / rawRange
+        uint256 scaledDelta = ((rawOdds - rawMin) * targetRange) / rawRange;
+        uint256 compressed = minTarget + scaledDelta;
+
+        // Safety bounds (should never trigger due to above checks)
+        if (compressed < minTarget) return minTarget;
+        if (compressed > maxTarget) return maxTarget;
+
+        return compressed;
+    }
+
+    /**
+     * @notice Get pool amount for a specific outcome
+     */
+    function _getOutcomePool(
+        DataTypes.MatchPool storage pool,
+        uint8 outcome
+    ) private view returns (uint256) {
+        if (outcome == Constants.OUTCOME_HOME_WIN) return pool.homeWinPool;
+        if (outcome == Constants.OUTCOME_AWAY_WIN) return pool.awayWinPool;
+        if (outcome == Constants.OUTCOME_DRAW) return pool.drawPool;
+        return 0;
+    }
+
+    /**
+     * @notice DEBUG: Get outcome pool value
+     */
+    function debugGetOutcomePool(
+        uint256 roundId,
+        uint256 matchIndex,
+        uint8 outcome
+    ) internal view returns (uint256 value, uint256 total, uint256 home, uint256 away, uint256 draw) {
+        DataTypes.MatchPool storage pool = BettingStorage.getMatchPool(roundId, matchIndex);
+        total = pool.totalPool;
+        home = pool.homeWinPool;
+        away = pool.awayWinPool;
+        draw = pool.drawPool;
+        value = _getOutcomePool(pool, outcome);
+    }
+
+    // ============ Parlay Multipliers ============
+
+    /**
+     * @notice Get parlay multiplier based on leg count
+     * @param legCount Number of matches in parlay (1-10)
+     * @return multiplier The base parlay multiplier (1e18 scale)
+     */
+    function getBaseParlayMultiplier(uint8 legCount) internal pure returns (uint256 multiplier) {
+        if (legCount <= 1) return Constants.PARLAY_MULT_1_MATCH;
+        if (legCount == 2) return Constants.PARLAY_MULT_2_MATCHES;
+        if (legCount == 3) return Constants.PARLAY_MULT_3_MATCHES;
+        if (legCount == 4) return Constants.PARLAY_MULT_4_MATCHES;
+        if (legCount == 5) return Constants.PARLAY_MULT_5_MATCHES;
+        if (legCount == 6) return Constants.PARLAY_MULT_6_MATCHES;
+        if (legCount == 7) return Constants.PARLAY_MULT_7_MATCHES;
+        if (legCount == 8) return Constants.PARLAY_MULT_8_MATCHES;
+        if (legCount == 9) return Constants.PARLAY_MULT_9_MATCHES;
+        return Constants.PARLAY_MULT_10_MATCHES; // 10+
+    }
+
+    /**
+     * @notice Get count-based parlay multiplier (FOMO mechanism)
+     * @dev Early parlays get higher multipliers
+     * @param parlayCount Current parlay count in round
+     * @return multiplier The count-based multiplier (1e18 scale)
+     */
+    function getCountBasedMultiplier(uint256 parlayCount) internal pure returns (uint256 multiplier) {
+        if (parlayCount < Constants.COUNT_TIER_1) return Constants.COUNT_MULT_TIER_1;
+        if (parlayCount < Constants.COUNT_TIER_2) return Constants.COUNT_MULT_TIER_2;
+        if (parlayCount < Constants.COUNT_TIER_3) return Constants.COUNT_MULT_TIER_3;
+        if (parlayCount < Constants.COUNT_TIER_4) return Constants.COUNT_MULT_TIER_4;
+        return Constants.COUNT_MULT_TIER_5;
+    }
+
+    /**
+     * @notice Get reserve-based decay factor
+     * @dev Reduces multipliers when reserves are high (safety valve)
+     * @param reservedAmount Total reserved for payouts
+     * @return decayBps Decay factor in basis points (10000 = 100%)
+     */
+    function getReserveDecay(uint256 reservedAmount) internal pure returns (uint256 decayBps) {
+        if (reservedAmount < Constants.RESERVE_TIER_1) return Constants.DECAY_TIER_1;
+        if (reservedAmount < Constants.RESERVE_TIER_2) return Constants.DECAY_TIER_2;
+        if (reservedAmount < Constants.RESERVE_TIER_3) return Constants.DECAY_TIER_3;
+        return Constants.DECAY_TIER_4;
+    }
+
+    /**
+     * @notice Calculate final parlay multiplier with all adjustments
+     * @param legCount Number of legs in parlay
+     * @param parlayCount Current round parlay count
+     * @param reservedAmount Total reserved for payouts
+     * @return finalMultiplier The fully adjusted multiplier (1e18 scale)
+     */
+    function calculateFinalParlayMultiplier(
+        uint8 legCount,
+        uint256 parlayCount,
+        uint256 reservedAmount
+    ) internal pure returns (uint256 finalMultiplier) {
+        // Single bets get no parlay bonus
+        if (legCount <= 1) return Constants.PRECISION;
+
+        // Use ONLY base multiplier from leg count (max 1.25x for 10 legs)
+        // Removed count-based and reserve decay multipliers for simplicity
+        finalMultiplier = getBaseParlayMultiplier(legCount);
+
+        // Ensure minimum multiplier for parlays
+        if (finalMultiplier < Constants.PRECISION) {
+            finalMultiplier = Constants.PRECISION;
+        }
+    }
+
+    // ============ Payout Calculation ============
+
+    /**
+     * @notice Calculate potential payout for a bet
+     * @param amount Bet amount
+     * @param matchIndices Match indices for the bet
+     * @param predictions Predicted outcomes
+     * @param roundId The round ID
+     * @return basePayout Base payout (without parlay multiplier)
+     * @return oddsProduct Combined odds product
+     */
+    function calculateBasePayout(
+        uint256 amount,
+        uint256[] memory matchIndices,
+        uint8[] memory predictions,
+        uint256 roundId
+    ) internal view returns (uint256 basePayout, uint256 oddsProduct) {
+        oddsProduct = Constants.PRECISION;
+
+        for (uint256 i = 0; i < matchIndices.length; i++) {
+            uint256 matchOdds = calculateOdds(roundId, matchIndices[i], predictions[i]);
+            oddsProduct = (oddsProduct * matchOdds) / Constants.PRECISION;
+        }
+
+        basePayout = (amount * oddsProduct) / Constants.PRECISION;
+    }
+
+    /**
+     * @notice Calculate full potential payout including parlay multiplier
+     * @param amount Bet amount
+     * @param matchIndices Match indices
+     * @param predictions Predicted outcomes
+     * @param roundId Round ID
+     * @param parlayMultiplier Locked parlay multiplier
+     * @return potentialPayout Full potential payout
+     */
+    function calculateFullPayout(
+        uint256 amount,
+        uint256[] memory matchIndices,
+        uint8[] memory predictions,
+        uint256 roundId,
+        uint256 parlayMultiplier
+    ) internal view returns (uint256 potentialPayout) {
+        (uint256 basePayout, ) = calculateBasePayout(amount, matchIndices, predictions, roundId);
+
+        // Apply parlay multiplier
+        potentialPayout = (basePayout * parlayMultiplier) / Constants.PRECISION;
+
+        // Cap at max payout
+        if (potentialPayout > Constants.MAX_PAYOUT_PER_BET) {
+            potentialPayout = Constants.MAX_PAYOUT_PER_BET;
+        }
+    }
+
+    // ============ Odds-Weighted Allocation ============
+
+    /**
+     * @notice Calculate odds-weighted allocation for a bet
+     * @dev Allocates more to underdog pools for balanced betting
+     * @param amount Bet amount
+     * @param roundId Round ID
+     * @param matchIndex Match index
+     * @param outcome Predicted outcome
+     * @return allocation Amount to allocate to pool
+     * @return borrowedFromLP Amount borrowed from LP to balance
+     */
+    function calculateOddsWeightedAllocation(
+        uint256 amount,
+        uint256 roundId,
+        uint256 matchIndex,
+        uint8 outcome
+    ) internal view returns (uint256 allocation, uint256 borrowedFromLP) {
+        uint256 odds = calculateOdds(roundId, matchIndex, outcome);
+
+        // Higher odds = more allocation (inverse of probability)
+        // Allocation = amount * (odds / averageOdds)
+        // For simplicity, use odds directly as weight
+        allocation = (amount * odds) / Constants.PRECISION;
+
+        // If allocation exceeds amount, LP covers the difference
+        if (allocation > amount) {
+            borrowedFromLP = allocation - amount;
+        } else {
+            allocation = amount;
+            borrowedFromLP = 0;
+        }
+    }
+}

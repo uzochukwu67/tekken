@@ -1,0 +1,416 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "./DataTypes.sol";
+import "./Constants.sol";
+import "./ValidationLogic.sol";
+import "./OddsLogic.sol";
+import "../storage/BettingStorage.sol";
+
+/**
+ * @title BetLogic
+ * @notice Core bet placement and cancellation logic
+ * @dev Handles bet creation, pool updates, LP borrowing, and cancellation
+ */
+library BetLogic {
+    using SafeERC20 for IERC20;
+
+    // ============ Events ============
+
+    event BetPlaced(
+        uint256 indexed betId,
+        address indexed bettor,
+        address indexed token,
+        uint256 roundId,
+        uint256 amount,
+        uint256 parlayMultiplier,
+        uint8 legCount
+    );
+
+    event BetCancelled(
+        uint256 indexed betId,
+        address indexed bettor,
+        uint256 refundAmount,
+        uint256 cancellationFee
+    );
+
+    event PoolUpdated(
+        uint256 indexed roundId,
+        uint256 indexed matchIndex,
+        uint8 outcome,
+        uint256 newPoolAmount
+    );
+
+    // ============ Errors ============
+
+    error InsufficientAllowance();
+    error TransferFailed();
+
+    // ============ Bet Placement ============
+
+    /**
+     * @notice Place a new bet
+     * @param params The bet parameters
+     * @return betId The ID of the created bet
+     */
+    function placeBet(
+        DataTypes.PlaceBetParams memory params
+    ) internal returns (uint256 betId) {
+        // Validate inputs
+        ValidationLogic.validatePlaceBetParams(params);
+
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        uint256 roundId = s.currentRoundId;
+
+        // Validate round state
+        ValidationLogic.validateRoundForBetting(roundId);
+
+        // Get next bet ID
+        betId = s.nextBetId++;
+
+        // Calculate parlay multiplier (locked at placement)
+        uint8 legCount = uint8(params.matchIndices.length);
+        DataTypes.RoundAccounting storage accounting = s.roundAccounting[roundId];
+
+        uint256 parlayMultiplier = OddsLogic.calculateFinalParlayMultiplier(
+            legCount,
+            accounting.parlayCount,
+            accounting.totalReservedForWinners
+        );
+
+        // Increment parlay count if multi-leg
+        if (legCount > 1) {
+            accounting.parlayCount++;
+        }
+
+        // Calculate allocations and LP borrowing
+        (
+            uint256 totalAllocated,
+            uint256 totalBorrowed,
+            uint256 potentialPayout,
+            DataTypes.Prediction[] memory predictions
+        ) = _calculateAllocations(params, roundId);
+
+        // Validate sufficient liquidity to cover potential payout
+        ValidationLogic.validateSufficientLiquidity(params.token, potentialPayout);
+
+        // Transfer tokens from bettor
+        IERC20(params.token).safeTransferFrom(params.bettor, address(this), params.amount);
+
+        // Store bet data
+        _storeBet(
+            betId,
+            params,
+            roundId,
+            totalAllocated,
+            totalBorrowed,
+            parlayMultiplier,
+            legCount
+        );
+
+        // Store predictions separately
+        _storePredictions(betId, predictions);
+
+        // Update pools
+        _updatePools(roundId, predictions);
+
+        // Update round accounting
+        accounting.totalBetVolume += uint128(params.amount);
+        accounting.lpBorrowedForBets += uint128(totalBorrowed);
+
+        // Track user bets
+        s.userBets[params.bettor].push(betId);
+        s.userRoundBetCount[params.bettor][roundId]++;
+
+        // Update token volume
+        s.tokenVolume[params.token] += params.amount;
+        s.totalVolumeAllTime += params.amount;
+        s.totalBetsPlaced++;
+
+        emit BetPlaced(
+            betId,
+            params.bettor,
+            params.token,
+            roundId,
+            params.amount,
+            parlayMultiplier,
+            legCount
+        );
+    }
+
+    /**
+     * @notice Calculate allocations for each prediction using backward allocation
+     * @dev Matches legacy system: calculates target payout first, then works backwards
+     *      to find required allocations per match for equal contribution
+     */
+    function _calculateAllocations(
+        DataTypes.PlaceBetParams memory params,
+        uint256 roundId
+    ) private view returns (
+        uint256 totalAllocated,
+        uint256 totalBorrowed,
+        uint256 potentialPayout,
+        DataTypes.Prediction[] memory predictions
+    ) {
+        uint256 legCount = params.matchIndices.length;
+        predictions = new DataTypes.Prediction[](legCount);
+
+        // Step 1: Calculate base payout (product of all odds)
+        uint256 basePayout = params.amount;
+        uint256[] memory matchOdds = new uint256[](legCount);
+
+        for (uint256 i = 0; i < legCount; i++) {
+            uint256 odds = OddsLogic.calculateOdds(
+                roundId,
+                params.matchIndices[i],
+                params.predictions[i]
+            );
+            matchOdds[i] = odds;
+
+            // Multiply: basePayout = basePayout × odds / PRECISION
+            basePayout = (basePayout * odds) / Constants.PRECISION;
+        }
+
+        // Step 2: Apply parlay multiplier
+        // For single bets, multiplier = 1e18, so no change
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        DataTypes.RoundAccounting storage accounting = s.roundAccounting[roundId];
+
+        uint256 parlayMultiplier = OddsLogic.calculateFinalParlayMultiplier(
+            uint8(legCount),
+            accounting.parlayCount,
+            accounting.totalReservedForWinners
+        );
+
+        uint256 targetPayout = (basePayout * parlayMultiplier) / Constants.PRECISION;
+        potentialPayout = targetPayout;
+
+        // Step 3: Calculate per-match contribution (equal across all matches)
+        uint256 perMatchContribution = targetPayout / legCount;
+
+        // Step 4: Work backwards to find required allocation for each match
+        for (uint256 i = 0; i < legCount; i++) {
+            // allocation × matchOdds = perMatchContribution
+            // Therefore: allocation = perMatchContribution / matchOdds
+            uint256 allocation = (perMatchContribution * Constants.PRECISION) / matchOdds[i];
+
+            predictions[i] = DataTypes.Prediction({
+                matchIndex: uint8(params.matchIndices[i]),
+                predictedOutcome: params.predictions[i],
+                amountInPool: uint128(allocation)
+            });
+
+            totalAllocated += allocation;
+        }
+
+        // Step 5: Calculate LP borrowing needed
+        if (totalAllocated > params.amount) {
+            totalBorrowed = totalAllocated - params.amount;
+        } else {
+            totalBorrowed = 0;
+        }
+    }
+
+    /**
+     * @notice Store bet data in storage
+     */
+    function _storeBet(
+        uint256 betId,
+        DataTypes.PlaceBetParams memory params,
+        uint256 roundId,
+        uint256 totalAllocated,
+        uint256 totalBorrowed,
+        uint256 parlayMultiplier,
+        uint8 legCount
+    ) private {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+
+        s.bets[betId] = DataTypes.Bet({
+            bettor: params.bettor,
+            token: params.token,
+            amount: uint128(params.amount),
+            allocatedAmount: uint128(totalAllocated),
+            lpBorrowedAmount: uint128(totalBorrowed),
+            bonus: 0, // Calculated at settlement
+            lockedMultiplier: uint128(parlayMultiplier),
+            roundId: uint64(roundId),
+            timestamp: uint32(block.timestamp),
+            legCount: legCount,
+            status: DataTypes.BetStatus.Active
+        });
+    }
+
+    /**
+     * @notice Store predictions separately
+     */
+    function _storePredictions(
+        uint256 betId,
+        DataTypes.Prediction[] memory predictions
+    ) private {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+
+        for (uint256 i = 0; i < predictions.length; i++) {
+            s.betPredictions[betId].predictions.push(predictions[i]);
+        }
+    }
+
+    /**
+     * @notice Update match pools with new allocations
+     */
+    function _updatePools(
+        uint256 roundId,
+        DataTypes.Prediction[] memory predictions
+    ) private {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+
+        for (uint256 i = 0; i < predictions.length; i++) {
+            DataTypes.Prediction memory pred = predictions[i];
+            DataTypes.MatchPool storage pool = s.matchPools[roundId][pred.matchIndex];
+
+            if (pred.predictedOutcome == Constants.OUTCOME_HOME_WIN) {
+                pool.homeWinPool += pred.amountInPool;
+            } else if (pred.predictedOutcome == Constants.OUTCOME_AWAY_WIN) {
+                pool.awayWinPool += pred.amountInPool;
+            } else {
+                pool.drawPool += pred.amountInPool;
+            }
+            pool.totalPool += pred.amountInPool;
+
+            emit PoolUpdated(
+                roundId,
+                pred.matchIndex,
+                pred.predictedOutcome,
+                _getOutcomePoolAmount(pool, pred.predictedOutcome)
+            );
+        }
+    }
+
+    /**
+     * @notice Get pool amount for outcome
+     */
+    function _getOutcomePoolAmount(
+        DataTypes.MatchPool storage pool,
+        uint8 outcome
+    ) private view returns (uint256) {
+        if (outcome == Constants.OUTCOME_HOME_WIN) return pool.homeWinPool;
+        if (outcome == Constants.OUTCOME_AWAY_WIN) return pool.awayWinPool;
+        return pool.drawPool;
+    }
+
+    // ============ Bet Cancellation ============
+
+    /**
+     * @notice Cancel an active bet
+     * @param betId The bet ID to cancel
+     * @param caller The address calling cancel
+     * @return refundAmount Amount refunded to bettor
+     */
+    function cancelBet(
+        uint256 betId,
+        address caller
+    ) internal returns (uint256 refundAmount) {
+        // Validate cancellation
+        DataTypes.Bet storage bet = ValidationLogic.validateBetForCancellation(betId, caller);
+
+        BettingStorage.Layout storage s = BettingStorage.layout();
+
+        // Calculate fee and refund
+        uint256 cancellationFee = (bet.amount * Constants.CANCELLATION_FEE_BPS) / Constants.BPS_PRECISION;
+        refundAmount = bet.amount - cancellationFee;
+
+        // Update bet status
+        bet.status = DataTypes.BetStatus.Cancelled;
+
+        // Revert pool allocations
+        _revertPoolAllocations(betId, bet.roundId);
+
+        // Update round accounting
+        DataTypes.RoundAccounting storage accounting = s.roundAccounting[bet.roundId];
+        accounting.totalBetVolume -= uint128(bet.amount);
+        accounting.lpBorrowedForBets -= uint128(bet.lpBorrowedAmount);
+
+        // If parlay, decrement count
+        if (bet.legCount > 1) {
+            if (accounting.parlayCount > 0) {
+                accounting.parlayCount--;
+            }
+        }
+
+        // Transfer refund to bettor
+        IERC20(bet.token).safeTransfer(bet.bettor, refundAmount);
+
+        // Fee goes to protocol treasury
+        if (cancellationFee > 0) {
+            IERC20(bet.token).safeTransfer(s.protocolTreasury, cancellationFee);
+        }
+
+        emit BetCancelled(betId, bet.bettor, refundAmount, cancellationFee);
+    }
+
+    /**
+     * @notice Revert pool allocations when bet is cancelled
+     */
+    function _revertPoolAllocations(uint256 betId, uint64 roundId) private {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        DataTypes.Prediction[] storage predictions = s.betPredictions[betId].predictions;
+
+        for (uint256 i = 0; i < predictions.length; i++) {
+            DataTypes.Prediction storage pred = predictions[i];
+            DataTypes.MatchPool storage pool = s.matchPools[roundId][pred.matchIndex];
+
+            if (pred.predictedOutcome == Constants.OUTCOME_HOME_WIN) {
+                pool.homeWinPool -= pred.amountInPool;
+            } else if (pred.predictedOutcome == Constants.OUTCOME_AWAY_WIN) {
+                pool.awayWinPool -= pred.amountInPool;
+            } else {
+                pool.drawPool -= pred.amountInPool;
+            }
+            pool.totalPool -= pred.amountInPool;
+        }
+    }
+
+    // ============ View Functions ============
+
+    /**
+     * @notice Get full bet information
+     * @param betId The bet ID
+     * @return info Complete bet information
+     */
+    function getBetInfo(uint256 betId) internal view returns (DataTypes.BetInfo memory info) {
+        BettingStorage.Layout storage s = BettingStorage.layout();
+        DataTypes.Bet storage bet = s.bets[betId];
+
+        info.bettor = bet.bettor;
+        info.token = bet.token;
+        info.amount = bet.amount;
+        info.roundId = bet.roundId;
+        info.lockedMultiplier = bet.lockedMultiplier;
+        info.legCount = bet.legCount;
+        info.status = bet.status;
+
+        // Copy predictions
+        DataTypes.Prediction[] storage preds = s.betPredictions[betId].predictions;
+        info.predictions = new DataTypes.Prediction[](preds.length);
+        for (uint256 i = 0; i < preds.length; i++) {
+            info.predictions[i] = preds[i];
+        }
+
+        // Calculate potential payout
+        uint256[] memory matchIndices = new uint256[](preds.length);
+        uint8[] memory outcomes = new uint8[](preds.length);
+        for (uint256 i = 0; i < preds.length; i++) {
+            matchIndices[i] = preds[i].matchIndex;
+            outcomes[i] = preds[i].predictedOutcome;
+        }
+
+        info.potentialPayout = OddsLogic.calculateFullPayout(
+            bet.amount,
+            matchIndices,
+            outcomes,
+            bet.roundId,
+            bet.lockedMultiplier
+        );
+    }
+}
